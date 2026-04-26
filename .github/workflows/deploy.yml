@@ -18,6 +18,7 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:github
+          version: latest
 
       - name: EC2에 접속해서 도커 실행하기
         uses: appleboy/ssh-action@v1.0.0
