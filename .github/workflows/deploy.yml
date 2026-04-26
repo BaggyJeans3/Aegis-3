@@ -1,0 +1,35 @@
+name: Deploy Aegis-3
+
+on:
+  push:
+    branches:
+      - main  # main 브랜치에 코드가 올라갈 때만 실행
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: Tailscale 네트워크 접속 (GitHub 서버를 VPN에 연결)
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: EC2에 접속해서 도커 실행하기
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_TAILSCALE_IP }}  # EC2의 100.x.x.x Tailscale IP
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}        # EC2 접속용 프라이빗 키 (.pem)
+          script: |
+            # 서버에 들어와서 할 일
+            cd /home/ubuntu/Aegis-3
+            git pull origin main
+            echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" > .env
+            echo "MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}" >> .env
+            echo "SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}" >> .env
+            sudo docker compose up -d --build
