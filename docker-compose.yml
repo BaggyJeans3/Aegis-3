@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # 1. 프록시 서버 (Node.js) - 모든 트래픽의 입구
+  # 프록시 서버 (Node.js) - 모든 트래픽의 입구
   aegis-proxy:
     build: ./proxy
     restart: always # 서버 다운 방지
@@ -16,18 +16,9 @@ services:
       - aegis-db
       - aegis-mongodb
       - aegis-redis
-      - aegis-portal # 포털이 먼저 준비되어야 함
 
-  # 2. 관리자 포털 (React)
-  aegis-portal:
-    build: ./portal
-    # 포트를 직접 열지 않아도 프록시(aegis-proxy)가 내부적으로 연결해줄 겁니다.
-    # 만약 따로 접속 확인하고 싶다면 "3000:80" 식으로 열어도 됩니다.
-    expose:
-      - '80'
-    restart: always # 서버 다운 방지
 
-  # 3. PostgreSQL (라우팅 정보)
+  # PostgreSQL (라우팅 정보)
   aegis-db:
     image: postgres:15
     restart: always # 서버 다운 방지
@@ -39,7 +30,7 @@ services:
       - ./data/db:/var/lib/postgresql/data
       - ./data/init.sql:/docker-entrypoint-initdb.d/init.sql
 
-  # 4. MongoDB (로그 저장)
+  # MongoDB (로그 저장)
   aegis-mongodb:
     image: mongo:latest
     restart: always # 서버 다운 방지
@@ -49,7 +40,7 @@ services:
     volumes:
       - ./data/mongo:/data/db
 
-  # 5. Redis (캐시)
+  # Redis (캐시)
   aegis-redis:
     image: redis:latest
     restart: always # 서버 다운 방지

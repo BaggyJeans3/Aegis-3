@@ -26,10 +26,18 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_SSH_KEY }}        # EC2 접속용 프라이빗 키 (.pem)
           script: |
-            # 서버에 들어와서 할 일
+            # 폴더가 없으면 클론부터, 있으면 폴더 들어가서 풀(pull)
+            if [ ! -d "/home/ubuntu/Aegis-3" ]; then
+              git clone https://github.com/[깃허브아이디]/Aegis-3.git /home/ubuntu/Aegis-3
+            fi
+            
             cd /home/ubuntu/Aegis-3
             git pull origin main
+            
+            # .env 파일 생성
             echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" > .env
             echo "MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}" >> .env
             echo "SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}" >> .env
+            
+            # 도커 실행
             sudo docker compose up -d --build
