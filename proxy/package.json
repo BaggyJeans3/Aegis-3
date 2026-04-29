@@ -1,0 +1,13 @@
+{
+  "name": "aegis3-proxy",
+  "version": "1.0.0",
+  "main": "app.js",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "http-proxy-middleware": "^3.0.3",
+    "pg": "^8.13.1",
+    "redis": "^4.7.0",
+    "uuid": "^11.0.3"
+  }
+}

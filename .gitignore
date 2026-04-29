@@ -1,0 +1,14 @@
+# Dependency
+node_modules/
+npm-debug.log
+
+# Environment Variables
+.env
+
+# System Files
+.DS_Store
+*.so
+*.log
+
+# Docker
+.docker/
