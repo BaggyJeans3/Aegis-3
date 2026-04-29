@@ -3,7 +3,7 @@ name: Deploy Aegis-3
 on:
   push:
     branches:
-      - main # main 브랜치에 코드가 올라갈 때만 실행
+      - main
 
 jobs:
   deploy:
@@ -12,7 +12,7 @@ jobs:
       - name: 저장소 코드 가져오기
         uses: actions/checkout@v3
 
-      - name: Tailscale 네트워크 접속 (GitHub 서버를 VPN에 연결)
+      - name: Tailscale 네트워크 접속
         uses: tailscale/github-action@v2
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
@@ -22,22 +22,26 @@ jobs:
       - name: EC2에 접속해서 도커 실행하기
         uses: appleboy/ssh-action@v1.0.0
         with:
-          host: ${{ secrets.EC2_TAILSCALE_IP }} # EC2의 100.x.x.x Tailscale IP
+          host: ${{ secrets.EC2_TAILSCALE_IP }}
           username: ubuntu
-          key: ${{ secrets.EC2_SSH_KEY }} # EC2 접속용 프라이빗 키 (.pem)
+          key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            # 폴더가 없으면 클론부터, 있으면 폴더 들어가서 풀(pull)
-            if [ ! -d "/home/ubuntu/Aegis-3" ]; then
+            # 최초 1회 clone
+            if [ ! -d "/home/ubuntu/Aegis-3/.git" ]; then
               git clone https://github.com/BaggyJeans3/Aegis-3.git /home/ubuntu/Aegis-3
             fi
 
             cd /home/ubuntu/Aegis-3
-            git pull origin main
 
-            # .env 파일 생성
-            echo "POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}" > .env
-            echo "MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}" >> .env
-            echo "SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}" >> .env
+            git fetch origin
+            git reset --hard origin/main
+
+            # env 생성
+            cat <<EOF > .env
+            POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
+            SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+            EOF
 
             # 도커 실행
             sudo docker compose up -d --build
