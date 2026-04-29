@@ -39,8 +39,10 @@ jobs:
             # env 생성
             cat <<EOF > .env
             POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
-            MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
             DB_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            DB_USER=aegis_admin
+            DB_NAME=aegis_proxy
+            MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
             SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
             EOF
 
