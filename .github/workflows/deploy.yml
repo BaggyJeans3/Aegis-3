@@ -1,0 +1,50 @@
+name: Deploy Aegis-3
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: Tailscale 네트워크 접속
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:github
+
+      - name: EC2에 접속해서 도커 실행하기
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.EC2_TAILSCALE_IP }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # 최초 1회 clone
+            if [ ! -d "/home/ubuntu/Aegis-3/.git" ]; then
+              git clone https://github.com/BaggyJeans3/Aegis-3.git /home/ubuntu/Aegis-3
+            fi
+
+            cd /home/ubuntu/Aegis-3
+
+            git fetch origin
+            git reset --hard origin/main
+
+            # env 생성
+            cat <<EOF > .env
+            POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            DB_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+            DB_USER=aegis_admin
+            DB_NAME=aegis_proxy
+            MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
+            SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+            EOF
+
+            # 도커 실행
+            sudo docker compose up -d --build

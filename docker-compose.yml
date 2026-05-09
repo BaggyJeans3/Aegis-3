@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # 1. Nginx + Coraza WAF
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: aegis-nginx
+    restart: unless-stopped
+    ports:
+      - '80:80'
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/coraza.conf:/etc/nginx/coraza.conf
+    depends_on:
+      - proxy
+    networks:
+      - aegis-net
+
+  # 2. 프록시 서버 (Node.js)
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: aegis-proxy
+    env_file: .env
+    environment:
+      - DB_HOST=postgres-db # DB 서비스 이름 일치
+      - DB_PASSWORD=${POSTGRES_PASSWORD} # PostgreSQL 컨테이너 비밀번호와 강제 일치
+      - REDIS_HOST=redis # Redis 서비스 이름 일치
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+    depends_on:
+      - postgres-db
+      - redis
+      - mongodb
+    restart: unless-stopped
+    networks:
+      - aegis-net
+
+  # 3. PostgreSQL (라우팅 정보 DB)
+  postgres-db:
+    image: postgres:15-alpine
+    container_name: aegis-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-aegis_admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${DB_NAME:-aegis_proxy}
+      TZ: Asia/Seoul
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./data/init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    networks:
+      - aegis-net
+
+  # 4. Redis (캐시)
+  redis:
+    image: redis:7-alpine
+    container_name: aegis-redis
+    restart: unless-stopped
+    networks:
+      - aegis-net
+
+  # 5. MongoDB (로그 저장)
+  mongodb:
+    image: mongo:latest
+    container_name: aegis-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: aegis_user
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+    volumes:
+      - mongo_data:/data/db
+    restart: unless-stopped
+    networks:
+      - aegis-net
+
+# 볼륨(데이터 영구 저장) 정의
+volumes:
+  postgres_data:
+  mongo_data:
+
+# 도커 내부 통신망 정의
+networks:
+  aegis-net:
+    driver: bridge

@@ -1,0 +1,20 @@
+
+#!/bin/bash
+# 시스템 업데이트 및 필요 패키지 설치
+apt-get update -y
+apt-get install -y curl
+
+# 도커/도커 컴포즈 설치 
+curl -fsSL https://get.docker.com -o get-docker.sh
+sh get-docker.sh
+apt-get install -y docker-compose-plugin
+
+
+# Tailscale 공식 설치 스크립트 실행
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# Tailscale 인증 및 시작 (Terraform에서 넘겨준 auth_key 사용)
+# 키가 존재할 경우에만 실행하도록 조건문 처리
+if [ -n "${tailscale_auth_key}" ]; then
+  tailscale up --authkey=${tailscale_auth_key}
+fi
