@@ -11,8 +11,12 @@ services:
     ports:
       - '80:80'
     volumes:
-      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ./nginx/coraza.conf:/etc/nginx/coraza.conf
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/coraza.conf:/etc/nginx/coraza.conf:ro
+      - ./nginx/crs-setup.conf:/etc/nginx/crs-setup.conf:ro
+      - ./nginx/crs:/etc/nginx/crs:ro
+      - ./nginx/rules:/etc/nginx/rules:ro
+      - ./nginx/logs:/var/log/coraza
     depends_on:
       - proxy
     networks:

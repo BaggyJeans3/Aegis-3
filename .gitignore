@@ -9,7 +9,28 @@ npm-debug.log
 .DS_Store
 *.so
 *.log
+*:Zone.Identifier
 
 # Docker
 .docker/
-.env
+
+# Coraza logs
+nginx/logs/*
+!nginx/logs/.gitkeep
+# Ignore unnecessary OWASP CRS source/dev files
+nginx/crs/AI-CONTRIBUTIONS.md
+nginx/crs/BACKPORT_POLICY.md
+nginx/crs/CHANGES.md
+nginx/crs/CONTRIBUTING.md
+nginx/crs/CONTRIBUTORS.md
+nginx/crs/INSTALL.md
+nginx/crs/KNOWN_BUGS.md
+nginx/crs/SECURITY.md
+nginx/crs/SPONSORS.md
+nginx/crs/crs-setup.conf.example
+nginx/crs/docs/
+nginx/crs/plugins/
+nginx/crs/regex-assembly/
+nginx/crs/renovate.json
+nginx/crs/tests/
+nginx/crs/util/

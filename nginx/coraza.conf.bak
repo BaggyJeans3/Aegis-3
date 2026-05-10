@@ -1,0 +1,30 @@
+# ==============================
+# Aegis-3 Coraza WAF Rules
+# ==============================
+
+SecRuleEngine On
+SecRequestBodyAccess On
+SecResponseBodyAccess On
+SecResponseBodyMimeType text/plain text/html text/xml application/json
+SecDataDir /tmp
+
+# 요청/응답 바디 제한: 졸작 데모 기준으로 과도한 요청 방지
+SecRequestBodyLimit 13107200
+SecRequestBodyNoFilesLimit 131072
+
+# [100] WAF 동작 확인용 테스트 룰
+# /?aegis_test=1 요청 시 403이 나오면 Coraza 연동이 성공한 것임
+SecRule ARGS:aegis_test "@streq 1" \
+    "id:100,phase:2,deny,status:403,log,msg:'Aegis-3 WAF Test Rule Triggered'"
+
+# [101] SQL Injection 기본 차단
+SecRule REQUEST_URI|ARGS|REQUEST_BODY "@rx (?i)(?:'\s*or\s*'1'\s*=\s*'1|\bor\b\s+\d+\s*=\s*\d+|union\s+select|sleep\s*\(|benchmark\s*\(|--|#|/\*)" \
+    "id:101,phase:2,deny,status:403,log,msg:'SQL Injection Detected',t:urlDecodeUni,t:lowercase"
+
+# [102] XSS 기본 차단
+SecRule REQUEST_URI|ARGS|REQUEST_BODY "@rx (?i)(?:<script|%3cscript|javascript:|onerror\s*=|onload\s*=)" \
+    "id:102,phase:2,deny,status:403,log,msg:'XSS Detected',t:urlDecodeUni,t:lowercase"
+
+# [103] 민감 파일 접근 차단 및 탐지
+SecRule REQUEST_URI "@rx (?i)(?:/\.env|/\.git|/wp-config\.php|/etc/passwd)" \
+    "id:103,phase:1,deny,status:403,log,msg:'Sensitive File Access Detected',t:urlDecodeUni,t:lowercase"

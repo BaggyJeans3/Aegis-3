@@ -70,10 +70,14 @@ FROM nginx:1.25-bookworm
 COPY --from=coraza-nginx-builder /usr/lib/nginx/modules/ngx_http_coraza_module.so /usr/lib/nginx/modules/ngx_http_coraza_module.so
 COPY --from=libcoraza-builder /usr/local/lib/libcoraza.so /usr/local/lib/libcoraza.so
 
-RUN ldconfig
+RUN ldconfig \
+    && mkdir -p /var/log/coraza /etc/nginx/crs /etc/nginx/rules
 
 COPY nginx.conf /etc/nginx/nginx.conf
 COPY coraza.conf /etc/nginx/coraza.conf
+COPY crs-setup.conf /etc/nginx/crs-setup.conf
+COPY crs /etc/nginx/crs
+COPY rules /etc/nginx/rules
 
 EXPOSE 80
 
