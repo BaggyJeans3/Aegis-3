@@ -59,5 +59,8 @@ jobs:
             EMAIL_PASS=${{ secrets.EMAIL_PASS }}
             EOF
 
+            # 도커 정리 (용량 부족 방지)
+            sudo docker system prune -af
+
             # 도커 실행
             sudo docker compose up -d --build
