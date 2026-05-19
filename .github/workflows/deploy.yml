@@ -59,6 +59,9 @@ jobs:
             EMAIL_PASS=${{ secrets.EMAIL_PASS }}
             EOF
 
+            # 기존 컨테이너 중지 (실행 중인 이미지를 prune하기 위해 필수)
+            sudo docker compose down
+
             # 도커 정리 (용량 부족 방지)
             sudo docker system prune -af
 
