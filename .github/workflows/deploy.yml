@@ -46,5 +46,18 @@ jobs:
             SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
             EOF
 
+            # analyzer env 생성
+            mkdir -p services/ingestion/analyzer
+            cat <<EOF > services/ingestion/analyzer/.env
+            SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            CF_TOKEN=${{ secrets.CF_TOKEN }}
+            ZONE_ID=${{ secrets.ZONE_ID }}
+            SLACK_BOT_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}
+            SLACK_SIGNING_SECRET=${{ secrets.SLACK_SIGNING_SECRET }}
+            EMAIL_USER=${{ secrets.EMAIL_USER }}
+            EMAIL_PASS=${{ secrets.EMAIL_PASS }}
+            EOF
+
             # 도커 실행
             sudo docker compose up -d --build
