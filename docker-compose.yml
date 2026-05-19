@@ -28,6 +28,9 @@ services:
     environment:
       - DB_HOST=postgres-db # DB 서비스 이름 일치
       - REDIS_HOST=redis # Redis 서비스 이름 일치
+      - DB_USER=aegis_admin
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=aegis_proxy
       - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
     depends_on:
       - postgres-db
@@ -60,6 +63,8 @@ services:
     restart: unless-stopped
     networks:
       - aegis-net
+    ports:
+      - "6379:6379"
 
   # 5. MongoDB (로그 저장)
   mongodb:
@@ -71,6 +76,61 @@ services:
     volumes:
       - mongo_data:/data/db
     restart: unless-stopped
+    networks:
+      - aegis-net
+
+# 6. SOAR 데이터 수집 API (FastAPI)
+  soar-api:
+    build:
+      context: ./services/ingestion/celery_app
+      dockerfile: Dockerfile
+    container_name: aegis-soar-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0 # Docker 내부에서는 서비스 이름(redis)으로 통신
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+    depends_on:
+      - redis
+      - mongodb
+    networks:
+      - aegis-net
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+
+  # 7. SOAR 백그라운드 워커 (Celery)
+  soar-worker:
+    build:
+      context: ./services/ingestion/celery_app
+      dockerfile: Dockerfile
+    container_name: aegis-soar-worker
+    restart: unless-stopped
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/1
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+    depends_on:
+      - redis
+      - mongodb
+      - soar-api
+    networks:
+      - aegis-net
+    command: celery -A tasks:celery_app worker --loglevel=info
+
+  # 8. 실시간 알림 및 차단 대응 엔진 (Node.js)
+  analyzer:
+    build:
+      context: ./services/ingestion/analyzer
+      dockerfile: Dockerfile
+    container_name: aegis-analyzer
+    restart: unless-stopped
+    env_file: ./services/ingestion/analyzer/.env
+    ports:
+      - "3000:3000"
+      - "5000:5000"
     networks:
       - aegis-net
 
