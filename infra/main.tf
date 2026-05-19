@@ -29,6 +29,13 @@ resource "aws_instance" "ec2" {
   # IAM 인스턴스 프로파일 연결 추가
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name
 
+  # 디스크 용량 증설 (t3.micro의 기본 8GB -> 20GB gp3)
+  root_block_device {
+    volume_size           = 20
+    volume_type           = "gp3"
+    delete_on_termination = true
+  }
+
   # Tailscale 자동 설치 스크립트 주입
   user_data = templatefile("${path.module}/user_data.sh.tftpl", {
     tailscale_auth_key = var.tailscale_auth_key
