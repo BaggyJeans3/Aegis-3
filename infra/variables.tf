@@ -17,7 +17,7 @@ variable "subnet_id" {
 
 variable "instance_type" {
   type    = string
-  default = "t3.micro"
+  default = "t3.small"
 }
 
 variable "associate_public_ip_address" {
