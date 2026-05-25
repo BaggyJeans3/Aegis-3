@@ -9,7 +9,7 @@ services:
     container_name: aegis-nginx
     restart: unless-stopped
     ports:
-      - '80:80'
+      - '8080:80'
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf
       - ./nginx/coraza.conf:/etc/nginx/coraza.conf
@@ -31,7 +31,7 @@ services:
       - DB_USER=aegis_admin
       - DB_PASSWORD=${POSTGRES_PASSWORD}
       - DB_NAME=aegis_proxy
-      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
     depends_on:
       - postgres-db
       - redis
@@ -92,7 +92,7 @@ services:
       - REDIS_URL=redis://redis:6379/0 # Docker 내부에서는 서비스 이름(redis)으로 통신
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
     depends_on:
       - redis
       - mongodb
@@ -100,7 +100,18 @@ services:
       - aegis-net
     command: uvicorn main:app --host 0.0.0.0 --port 8000
 
-  # 7. SOAR 백그라운드 워커 (Celery)
+  # 7. Risk Score Engine
+  detection-engine:
+    build:
+      context: .
+      dockerfile: soar/risk_score_engine/Dockerfile
+    container_name: aegis-detection-engine
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    networks:
+      - aegis-net
+  # 8. SOAR 백그라운드 워커 (Celery)
   soar-worker:
     build:
       context: ./services/ingestion/celery_app
@@ -111,16 +122,18 @@ services:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
-      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs
+      - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
+      - RISK_ANALYZER_URL=http://detection-engine:5000/analyze    
     depends_on:
       - redis
       - mongodb
       - soar-api
+      - detection-engine
     networks:
       - aegis-net
     command: celery -A tasks:celery_app worker --loglevel=info
 
-  # 8. 실시간 알림 및 차단 대응 엔진 (Node.js)
+  # 9. 실시간 알림 및 차단 대응 엔진 (Node.js)
   analyzer:
     build:
       context: ./services/ingestion/analyzer

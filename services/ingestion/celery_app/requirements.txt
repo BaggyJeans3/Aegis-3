@@ -4,4 +4,4 @@ celery
 redis
 pydantic
 requests
-
+pymongo

@@ -8,21 +8,22 @@ require('dotenv').config();
 const app = express();
 
 app.use(express.json());
+
 // 1. 루트 경로 (/) 정의: 404 방지 및 시스템 상태 확인용
 app.get('/', (req, res) => {
-    res.json({
-        status: "success",
-        message: "Aegis-3 Security Proxy is running."
-    });
+  res.json({
+    status: 'success',
+    message: 'Aegis-3 Security Proxy is running.',
+  });
 });
 
 // 2. 마스킹 테스트용 경로 (/user): Nginx의 sub_filter 작동 확인용
 app.get('/user', (req, res) => {
-    res.json({
-        name: "홍길동",
-        phone: "010-9999-8888", // Nginx에서 010-9999-****로 바뀌어야 함
-        ssn: "900101-1234567"   // Nginx에서 900101-1******로 바뀌어야 함
-    });
+  res.json({
+    name: '홍길동',
+    phone: '010-9999-8888', // Nginx에서 010-9999-****로 바뀌어야 함
+    ssn: '900101-1234567', // Nginx에서 900101-1******로 바뀌어야 함
+  });
 });
 
 const PORT = process.env.PORT || 3000;
@@ -42,9 +43,16 @@ function normalizeHost(hostHeader) {
 }
 
 function getClientIp(req) {
+  const forwardedFor = req.headers['x-forwarded-for'];
+
+  // [수정] Nginx/Cloudflare 뒤에 있을 때 X-Forwarded-For에는
+  // "client, proxy1, proxy2"처럼 여러 IP가 들어갈 수 있으므로 첫 번째 IP를 우선 사용한다.
+  if (forwardedFor) {
+    return String(forwardedFor).split(',')[0].trim();
+  }
+
   return (
     req.headers['cf-connecting-ip'] ||
-    req.headers['x-forwarded-for'] ||
     req.ip ||
     'unknown'
   );
@@ -126,13 +134,78 @@ function findRouteFromCache(host, path, method) {
   return null;
 }
 
-async function pushSecurityEvent(eventData) {
-  const event = {
-    event_id: uuidv4(),
-    timestamp: new Date().toISOString(),
-    ...eventData,
-  };
+/**
+ * [추가] Analyzer 입력용으로 Redis 이벤트 로그 필드를 통일한다.
+ *
+ * 기존 Redis 로그:
+ * - target_domain, request_path, attacker_ip, action_taken
+ *
+ * 수정 후 Redis 로그:
+ * - host, path, ip, action_on_match, status_code
+ *
+ * 이유:
+ * Risk Score Analyzer 코드가 log.get("path"), log.get("ip"),
+ * log.get("status_code") 같은 flat 필드명을 기준으로 분석하기 때문이다.
+ */
+function buildAnalyzerEvent(req, route, options = {}) {
+  const eventId = uuidv4();
+  const traceId = req.headers['x-request-id'] || req.headers['x-trace-id'] || `trace-${eventId}`;
+  const queryIndex = req.originalUrl.indexOf('?');
 
+  // [추가] payload 탐지를 위해 query/body/headers를 넣되,
+  // 너무 큰 body가 Redis에 들어가지 않도록 JSON 문자열 기준으로 길이를 제한한다.
+  let requestBody = '';
+
+  if (req.body && Object.keys(req.body).length > 0) {
+    try {
+      requestBody = JSON.stringify(req.body).slice(0, 2000);
+    } catch (error) {
+      requestBody = '[unserializable_body]';
+    }
+  }
+
+  return {
+    event_id: eventId,
+    trace_id: traceId,
+    timestamp: new Date().toISOString(),
+
+    // [추가] 이벤트 성격과 분석 범위를 분리한다.
+    // access_event는 정상 proxy 요청의 요청량 폭증 탐지용,
+    // honeypot/block/log_only/no_route는 full 분석 대상으로 사용한다.
+    event_type: options.event_type || 'security_event',
+    analysis_profile: options.analysis_profile || 'full',
+
+    tenant_id: route?.tenant_id || null,
+    company_name: route?.company_name || null,
+
+    ip: getClientIp(req),
+    session_id: req.headers['x-session-id'] || req.headers['cookie'] || 'unknown',
+
+    method: req.method,
+    host: normalizeHost(req.headers.host),
+    path: req.path,
+    query: queryIndex >= 0 ? req.originalUrl.slice(queryIndex + 1) : '',
+    headers: {
+      'user-agent': req.headers['user-agent'] || null,
+      'x-forwarded-for': req.headers['x-forwarded-for'] || null,
+      'cf-connecting-ip': req.headers['cf-connecting-ip'] || null,
+      authorization: req.headers.authorization ? '[present]' : null,
+      'content-type': req.headers['content-type'] || null,
+    },
+    body: requestBody,
+
+    // [추가] status_code는 404/403/200처럼 Analyzer 탐지 기준에서 필요하다.
+    // proxy 요청은 이 시점에 origin 응답을 아직 받기 전이라 0으로 둔다.
+    // 이후 Worker/ProxyRes 단계에서 실제 응답코드로 보강할 수 있다.
+    status_code: options.status_code ?? 0,
+
+    action_on_match: options.action_on_match || route?.action_on_match || 'unknown',
+    route_id: route?.route_id || null,
+    route_description: route?.description || null,
+  };
+}
+
+async function pushSecurityEvent(event) {
   console.log('[SECURITY EVENT]', JSON.stringify(event));
 
   if (redisClient.isOpen) {
@@ -141,20 +214,16 @@ async function pushSecurityEvent(eventData) {
 }
 
 function sendHoneypotResponse(req, res, route) {
-  const clientIp = getClientIp(req);
-
-  pushSecurityEvent({
+  // [수정] honeypot 요청은 full 분석 대상이다.
+  // 민감 경로 접근, payload 우회, 반복 접근 등을 모두 Analyzer에서 확인할 수 있다.
+  const event = buildAnalyzerEvent(req, route, {
     event_type: 'honeypot_hit',
-    tenant_id: route?.tenant_id || null,
-    company_name: route?.company_name || null,
-    target_domain: normalizeHost(req.headers.host),
-    request_path: req.path,
-    method: req.method,
-    attacker_ip: clientIp,
-    user_agent: req.headers['user-agent'] || null,
-    action_taken: 'honeypot',
-    description: route?.description || 'honeypot route matched',
-  }).catch((error) => {
+    analysis_profile: 'full',
+    status_code: 200,
+    action_on_match: 'honeypot',
+  });
+
+  pushSecurityEvent(event).catch((error) => {
     console.error('[REDIS LOG ERROR]', error.message);
   });
 
@@ -166,20 +235,16 @@ function sendHoneypotResponse(req, res, route) {
 }
 
 function sendBlockedResponse(req, res, route) {
-  const clientIp = getClientIp(req);
-
-  pushSecurityEvent({
+  // [수정] block 요청은 full 분석 대상이다.
+  // 이미 정책상 차단된 요청이므로 위험 이벤트로 기록한다.
+  const event = buildAnalyzerEvent(req, route, {
     event_type: 'blocked_request',
-    tenant_id: route?.tenant_id || null,
-    company_name: route?.company_name || null,
-    target_domain: normalizeHost(req.headers.host),
-    request_path: req.path,
-    method: req.method,
-    attacker_ip: clientIp,
-    user_agent: req.headers['user-agent'] || null,
-    action_taken: 'block',
-    description: route?.description || 'blocked by policy',
-  }).catch((error) => {
+    analysis_profile: 'full',
+    status_code: 403,
+    action_on_match: 'block',
+  });
+
+  pushSecurityEvent(event).catch((error) => {
     console.error('[REDIS LOG ERROR]', error.message);
   });
 
@@ -190,20 +255,33 @@ function sendBlockedResponse(req, res, route) {
 }
 
 function sendLogOnlyResponse(req, route) {
-  const clientIp = getClientIp(req);
+  // [수정] log_only 요청은 차단하지 않지만 이상 패턴 분석 대상이다.
+  // catch-all 또는 관찰용 규칙에 걸린 요청이므로 full 분석 대상으로 Redis에 넣는다.
+  const event = buildAnalyzerEvent(req, route, {
+    event_type: 'log_only_event',
+    analysis_profile: 'full',
+    status_code: 0,
+    action_on_match: 'log_only',
+  });
 
-  pushSecurityEvent({
-    event_type: 'log_only',
-    tenant_id: route?.tenant_id || null,
-    company_name: route?.company_name || null,
-    target_domain: normalizeHost(req.headers.host),
-    request_path: req.path,
-    method: req.method,
-    attacker_ip: clientIp,
-    user_agent: req.headers['user-agent'] || null,
-    action_taken: 'log_only',
-    description: route?.description || 'logged only',
-  }).catch((error) => {
+  pushSecurityEvent(event).catch((error) => {
+    console.error('[REDIS LOG ERROR]', error.message);
+  });
+}
+
+function sendAccessEvent(req, route) {
+  // [추가] 정상 proxy 요청도 Redis에 넣는다.
+  // 이유: 정상 경로라도 60초 안에 과도하게 반복되면 API 자원 사용량 초과 탐지 대상이기 때문이다.
+  // 단, 위험 이벤트가 아니므로 event_type은 access_event,
+  // analysis_profile은 rate_only로 분리한다.
+  const event = buildAnalyzerEvent(req, route, {
+    event_type: 'access_event',
+    analysis_profile: 'rate_only',
+    status_code: 0,
+    action_on_match: 'proxy',
+  });
+
+  pushSecurityEvent(event).catch((error) => {
     console.error('[REDIS LOG ERROR]', error.message);
   });
 }
@@ -255,18 +333,16 @@ app.use(async (req, res, next) => {
   const matchedRoute = findRouteFromCache(host, path, method);
 
   if (!matchedRoute) {
-    await pushSecurityEvent({
+    // [수정] route가 없는 요청도 Analyzer 입력 필드명에 맞춰 Redis에 기록한다.
+    // 고객사/라우팅 정책에 없는 도메인이나 경로를 찌르는 스캐닝 가능성이 있기 때문이다.
+    const event = buildAnalyzerEvent(req, null, {
       event_type: 'no_matching_route',
-      tenant_id: null,
-      company_name: null,
-      target_domain: normalizeHost(host),
-      request_path: path,
-      method,
-      attacker_ip: clientIp,
-      user_agent: req.headers['user-agent'] || null,
-      action_taken: 'block',
-      description: 'No matching route found',
+      analysis_profile: 'full',
+      status_code: 404,
+      action_on_match: 'no_route',
     });
+
+    await pushSecurityEvent(event);
 
     return res.status(404).json({
       status: 'not_found',
@@ -306,6 +382,10 @@ app.use(async (req, res, next) => {
         });
       }
 
+      // [추가] 정상 proxy 요청도 access_event로 Redis에 넣는다.
+      // 위험 이벤트가 아니라 요청량 폭증 탐지용 이벤트다.
+      sendAccessEvent(req, matchedRoute);
+
       req.targetOrigin = matchedRoute.target_origin;
       return next();
 
@@ -324,7 +404,7 @@ const dynamicProxyMiddleware = createProxyMiddleware({
   xfwd: true,
   router: (req) => {
     return req.targetOrigin;
-  }
+  },
 });
 
 // targetOrigin이 설정된 요청만 프록시 미들웨어 통과
@@ -332,6 +412,7 @@ app.use((req, res, next) => {
   if (req.targetOrigin) {
     return dynamicProxyMiddleware(req, res, next);
   }
+
   next();
 });
 
