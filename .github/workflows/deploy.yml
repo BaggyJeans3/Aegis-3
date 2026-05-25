@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: 저장소 코드 가져오기
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Tailscale 네트워크 접속
         uses: tailscale/github-action@v2
@@ -45,6 +45,30 @@ jobs:
             MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
             SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
             EOF
+
+            # analyzer env 생성
+            mkdir -p services/ingestion/analyzer
+            cat <<EOF > services/ingestion/analyzer/.env
+            SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            CF_TOKEN=${{ secrets.CF_TOKEN }}
+            ZONE_ID=${{ secrets.ZONE_ID }}
+            SLACK_BOT_TOKEN=${{ secrets.SLACK_BOT_TOKEN }}
+            SLACK_SIGNING_SECRET=${{ secrets.SLACK_SIGNING_SECRET }}
+            EMAIL_USER=${{ secrets.EMAIL_USER }}
+            EMAIL_PASS=${{ secrets.EMAIL_PASS }}
+            EOF
+
+            # 기존 컨테이너 중지 (실행 중인 이미지를 prune하기 위해 필수)
+            sudo docker compose down
+
+            # 호스트 시스템 디스크 용량 확보 (우분투 로그 및 apt 패키지 캐시 청소)
+            sudo apt-get clean
+            sudo journalctl --vacuum-size=50M
+
+            # 도커 정리 (용량 부족 방지)
+            sudo docker system prune -af
+            sudo docker builder prune -af
 
             # 도커 실행
             sudo docker compose up -d --build

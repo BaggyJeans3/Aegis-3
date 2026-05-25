@@ -295,11 +295,8 @@ app.use(async (req, res, next) => {
         });
       }
 
-      return createProxyMiddleware({
-        target: matchedRoute.target_origin,
-        changeOrigin: true,
-        xfwd: true,
-      })(req, res, next);
+      req.targetOrigin = matchedRoute.target_origin;
+      return next();
 
     case 'proxy':
       if (!isValidOrigin(matchedRoute.target_origin)) {
@@ -309,11 +306,8 @@ app.use(async (req, res, next) => {
         });
       }
 
-      return createProxyMiddleware({
-        target: matchedRoute.target_origin,
-        changeOrigin: true,
-        xfwd: true,
-      })(req, res, next);
+      req.targetOrigin = matchedRoute.target_origin;
+      return next();
 
     default:
       return res.status(500).json({
@@ -321,6 +315,24 @@ app.use(async (req, res, next) => {
         message: 'Unknown route action',
       });
   }
+});
+
+// 단일 프록시 미들웨어 인스턴스 생성 (router 옵션을 통한 동적 라우팅)
+const dynamicProxyMiddleware = createProxyMiddleware({
+  target: 'http://localhost', // 기본값 (router 함수에서 덮어씌워짐)
+  changeOrigin: true,
+  xfwd: true,
+  router: (req) => {
+    return req.targetOrigin;
+  }
+});
+
+// targetOrigin이 설정된 요청만 프록시 미들웨어 통과
+app.use((req, res, next) => {
+  if (req.targetOrigin) {
+    return dynamicProxyMiddleware(req, res, next);
+  }
+  next();
 });
 
 async function startServer() {
