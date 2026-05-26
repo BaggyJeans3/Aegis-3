@@ -3,6 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime
+from urllib.parse import quote_plus
 from pymongo import MongoClient
 
 from celery_app import celery_app, redis_client
@@ -61,11 +62,31 @@ def normalize_redis_log(log_data):
     raise ValueError(f"Unsupported log_data type: {type(log_data)}")
 
 
+def _build_mongo_uri():
+    """
+    MONGO_USER / MONGO_PASSWORD 가 따로 주어지면 패스워드를 URL-encode 해서 URI 를 조립한다.
+    docker-compose 가 ${VAR} 치환 시 URL-escape 하지 않기 때문에, 패스워드에 @ : / ? # 등이
+    들어있으면 MONGO_URI 그대로는 pymongo 가 거절한다. 별도 컴포넌트를 받아 안전하게 만든다.
+    """
+    user = os.getenv("MONGO_USER")
+    password = os.getenv("MONGO_PASSWORD")
+    if user and password:
+        host = os.getenv("MONGO_HOST", "mongodb")
+        port = os.getenv("MONGO_PORT", "27017")
+        db_name = os.getenv("MONGO_DB_NAME", "aegis_logs")
+        auth_source = os.getenv("MONGO_AUTH_SOURCE", "admin")
+        return (
+            f"mongodb://{quote_plus(user)}:{quote_plus(password)}"
+            f"@{host}:{port}/{db_name}?authSource={auth_source}"
+        )
+    return MONGO_URI
+
+
 def get_mongo_collection():
     """
     MongoDB collection 객체를 반환한다.
     """
-    client = MongoClient(MONGO_URI)
+    client = MongoClient(_build_mongo_uri())
     db = client[MONGO_DB_NAME]
     return db[MONGO_COLLECTION_NAME]
 
@@ -126,8 +147,9 @@ def _build_coraza_rule(rule: dict) -> str:
     # 룰 ID 충돌 방지:
     # - 900000~999999 는 OWASP CRS 가 점유 (REQUEST/RESPONSE 9xx 시리즈)
     # - 100~100090 은 aegis3-custom-rules.conf 가 사용
-    # 따라서 AI 생성 룰은 2,000,000~2,999,999 범위로 격리한다.
-    rule_id = 2000000 + int(time.time()) % 999999
+    # AI 룰은 32-bit 정수 한계(약 21억) 안의 2,000,000,000~2,099,999,999 범위로 격리.
+    # ms 정밀도 + 1억 modulo → 약 11.5년 cycle, 같은 ms 동시 발화 외엔 자체 충돌 없음.
+    rule_id = 2_000_000_000 + (int(time.time() * 1000) % 100_000_000)
     return (
         f'SecRule REQUEST_URI|ARGS|REQUEST_BODY "@rx {regex}" '
         f'"id:{rule_id},phase:2,deny,status:403,msg:\'{name}\',log"'

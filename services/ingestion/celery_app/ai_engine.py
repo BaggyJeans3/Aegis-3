@@ -4,18 +4,16 @@ import re
 import json
 import os
 
-_client = None
-
-
 def _get_client():
-    global _client
-    if _client is not None:
-        return _client
+    """
+    매 호출마다 새 Client 를 생성한다.
+    Celery prefork pool 의 child worker 에서 module-level 캐시된 grpc client 를 재사용하면
+    fork-after-init 이슈로 첫 RPC 호출이 silently 실패할 수 있어, 캐싱하지 않는다.
+    """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY 환경 변수가 설정되어 있지 않습니다.")
-    _client = genai.Client(api_key=api_key)
-    return _client
+    return genai.Client(api_key=api_key)
 
 
 def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> dict:

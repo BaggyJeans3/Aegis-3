@@ -44,6 +44,7 @@ jobs:
             DB_NAME=aegis_proxy
             MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }}
             SLACK_WEBHOOK_URL=${{ secrets.SLACK_WEBHOOK_URL }}
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
             EOF
 
             # analyzer env 생성
