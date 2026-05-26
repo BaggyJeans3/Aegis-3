@@ -93,6 +93,9 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
+      - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
     depends_on:
       - redis
       - mongodb
@@ -123,7 +126,10 @@ services:
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/1
       - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
-      - RISK_ANALYZER_URL=http://detection-engine:5000/analyze    
+      - RISK_ANALYZER_URL=http://detection-engine:5000/analyze
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
+      - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
     depends_on:
       - redis
       - mongodb

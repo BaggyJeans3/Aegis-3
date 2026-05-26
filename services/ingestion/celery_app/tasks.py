@@ -1,9 +1,12 @@
-from celery_app import celery_app, redis_client
-import json
 import os
+import json
+import time
 import requests
 from datetime import datetime
 from pymongo import MongoClient
+
+from celery_app import celery_app, redis_client
+from ai_engine import generate_waf_rule_with_feedback
 
 
 # ============================================================
@@ -30,6 +33,13 @@ MONGO_URI = os.getenv(
 
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "aegis_logs")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "security_logs")
+
+# AI 룰 생성 임계값 및 Nginx 사이드카(룰 주입) 엔드포인트
+AI_RULE_THRESHOLD = int(os.getenv("AI_RULE_THRESHOLD", "80"))
+NGINX_SIDECAR_URL = os.getenv(
+    "NGINX_SIDECAR_URL",
+    "http://nginx-sidecar:4000/api/v1/rules/inject"
+)
 
 
 def normalize_redis_log(log_data):
@@ -109,16 +119,39 @@ def build_mongo_document(raw_event, analyzer_result):
     }
 
 
+def _build_coraza_rule(rule: dict) -> str:
+    """AI가 반환한 dict를 Coraza SecRule 한 줄로 직렬화"""
+    regex = rule.get("regex", "").replace('"', '\\"')
+    name = rule.get("rule_name", "AI_GENERATED").replace('"', '\\"')
+    # 단순 ID 충돌 방지를 위해 시간 기반 ID 사용
+    rule_id = 900000 + int(time.time()) % 99999
+    return (
+        f'SecRule REQUEST_URI|ARGS|REQUEST_BODY "@rx {regex}" '
+        f'"id:{rule_id},phase:2,deny,status:403,msg:\'{name}\',log"'
+    )
+
+
+def _inject_rule_to_nginx(rule: dict) -> None:
+    """생성된 WAF 룰을 Nginx 사이드카로 전송"""
+    try:
+        rule_str = _build_coraza_rule(rule)
+        resp = requests.post(
+            NGINX_SIDECAR_URL,
+            json={"rule": rule_str},
+            timeout=5,
+        )
+        print(f"[Worker] WAF 룰 주입 응답: {resp.status_code} - {resp.text[:200]}")
+    except Exception as inj_err:
+        print(f"[Error] Nginx 사이드카 룰 주입 실패: {inj_err}")
+
+
 @celery_app.task(bind=True, max_retries=3)
 def process_security_log(self, log_data):
     """
     Redis에서 꺼낸 단일 이벤트 로그를 처리하는 Task.
 
-    기존 구조:
-    Redis 이벤트 → analyzer:5000/api/v1/report → Slack/CF/Email 대응
-
-    수정 구조:
     Redis 이벤트 → Risk Score Engine /analyze → MongoDB 저장
+                → (risk_score ≥ AI_RULE_THRESHOLD) AI WAF 룰 생성 → Nginx 사이드카 주입
     """
     try:
         raw_event = normalize_redis_log(log_data)
@@ -163,13 +196,27 @@ def process_security_log(self, log_data):
             print(f"[Error] MongoDB 저장 실패: {mongo_err}")
             raise mongo_err
 
+        # ------------------------------------------------------------
+        # 3. 고위험 시 AI WAF 룰 생성 → Nginx 사이드카로 주입
+        # ------------------------------------------------------------
+        detection_result = analyzer_result.get("detection_result", {})
+        risk_score = int(detection_result.get("risk_score") or 0)
+        if risk_score >= AI_RULE_THRESHOLD:
+            print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
+            ai_rule = generate_waf_rule_with_feedback(raw_event)
+            if ai_rule and ai_rule.get("regex"):
+                print(f"[Worker] ✅ AI 룰 생성됨: {ai_rule.get('rule_name')} (confidence={ai_rule.get('confidence_score')})")
+                _inject_rule_to_nginx(ai_rule)
+            else:
+                print(f"[Worker] ⚠️ AI 룰 생성 실패(반환 None) — 주입 건너뜀")
+
         print("[Worker] 로그 처리 완료")
 
         return {
             "status": "success",
             "event_id": raw_event.get("event_id"),
-            "risk_score": analyzer_result.get("detection_result", {}).get("risk_score"),
-            "level": analyzer_result.get("detection_result", {}).get("level"),
+            "risk_score": risk_score,
+            "level": detection_result.get("level"),
         }
 
     except Exception as exc:
