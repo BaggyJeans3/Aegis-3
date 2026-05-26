@@ -1,0 +1,9 @@
+{
+  "name": "aegis-nginx-sidecar",
+  "version": "1.0.0",
+  "private": true,
+  "main": "sidecar.js",
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}

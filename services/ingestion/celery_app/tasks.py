@@ -38,7 +38,7 @@ MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "security_logs")
 AI_RULE_THRESHOLD = int(os.getenv("AI_RULE_THRESHOLD", "80"))
 NGINX_SIDECAR_URL = os.getenv(
     "NGINX_SIDECAR_URL",
-    "http://nginx-sidecar:4000/api/v1/rules/inject"
+    "http://nginx:4000/api/v1/rules/inject"
 )
 
 
@@ -123,8 +123,11 @@ def _build_coraza_rule(rule: dict) -> str:
     """AI가 반환한 dict를 Coraza SecRule 한 줄로 직렬화"""
     regex = rule.get("regex", "").replace('"', '\\"')
     name = rule.get("rule_name", "AI_GENERATED").replace('"', '\\"')
-    # 단순 ID 충돌 방지를 위해 시간 기반 ID 사용
-    rule_id = 900000 + int(time.time()) % 99999
+    # 룰 ID 충돌 방지:
+    # - 900000~999999 는 OWASP CRS 가 점유 (REQUEST/RESPONSE 9xx 시리즈)
+    # - 100~100090 은 aegis3-custom-rules.conf 가 사용
+    # 따라서 AI 생성 룰은 2,000,000~2,999,999 범위로 격리한다.
+    rule_id = 2000000 + int(time.time()) % 999999
     return (
         f'SecRule REQUEST_URI|ARGS|REQUEST_BODY "@rx {regex}" '
         f'"id:{rule_id},phase:2,deny,status:403,msg:\'{name}\',log"'

@@ -70,7 +70,11 @@ FROM nginx:1.25-bookworm
 COPY --from=coraza-nginx-builder /usr/lib/nginx/modules/ngx_http_coraza_module.so /usr/lib/nginx/modules/ngx_http_coraza_module.so
 COPY --from=libcoraza-builder /usr/local/lib/libcoraza.so /usr/local/lib/libcoraza.so
 
-RUN ldconfig \
+# Node.js + npm: 룰 주입 사이드카(Express) 구동용
+RUN apt-get update -qq \
+    && apt-get install -y --no-install-recommends nodejs npm \
+    && rm -rf /var/lib/apt/lists/* \
+    && ldconfig \
     && mkdir -p /var/log/coraza /etc/nginx/crs /etc/nginx/rules
 
 COPY nginx.conf /etc/nginx/nginx.conf
@@ -79,6 +83,16 @@ COPY crs-setup.conf /etc/nginx/crs-setup.conf
 COPY crs /etc/nginx/crs
 COPY rules /etc/nginx/rules
 
-EXPOSE 80
+# Sidecar (룰 주입 API)
+WORKDIR /opt/sidecar
+COPY package.json ./package.json
+RUN npm install --omit=dev
+COPY sidecar.js ./sidecar.js
 
-CMD ["nginx", "-g", "daemon off;"]
+# 엔트리포인트: nginx + 사이드카 동시 기동
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+EXPOSE 80 4000
+
+CMD ["/usr/local/bin/entrypoint.sh"]
