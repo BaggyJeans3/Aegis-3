@@ -8,6 +8,10 @@ CREATE TABLE tenants (
     api_key VARCHAR(255) UNIQUE NOT NULL,
     plan_type VARCHAR(50) DEFAULT 'FREE',
     status VARCHAR(30) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive', 'suspended')),
+    -- Supabase 회원과 연결: 이 고객사가 어느 회원 소유인지
+    supabase_user_id UUID,
+    -- API 명세서 원문(텍스트). OpenAPI/Swagger 내용을 통째로 저장
+    spec_text TEXT,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -29,6 +33,8 @@ CREATE TABLE routers (
 
 -- 인덱스 생성
 CREATE INDEX idx_routers_domain_active ON routers(inbound_domain) WHERE is_active = TRUE;
+-- supabase_user_id 로 고객사 조회가 잦으므로 인덱스 추가
+CREATE INDEX idx_tenants_supabase_user ON tenants(supabase_user_id);
 
 -- 테스트 데이터 삽입
 INSERT INTO tenants (company_name, api_key, status) 
