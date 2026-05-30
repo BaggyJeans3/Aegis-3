@@ -82,6 +82,10 @@ COPY coraza.conf /etc/nginx/coraza.conf
 COPY crs-setup.conf /etc/nginx/crs-setup.conf
 COPY crs /etc/nginx/crs
 COPY rules /etc/nginx/rules
+# Baseline copy used by entrypoint to sync static rules into the
+# nginx_dynamic_rules volume on every start (volume preserves dynamic.conf
+# but stale static rules would otherwise never refresh).
+COPY rules /opt/aegis-rules-baseline
 
 # Sidecar (룰 주입 API)
 WORKDIR /opt/sidecar
