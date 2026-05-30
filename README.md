@@ -214,3 +214,68 @@ docker exec aegis-redis redis-cli LPUSH aegis:security-events \
 
 docker exec aegis-nginx cat /etc/nginx/rules/dynamic.conf   # AI 가 만든 SecRule 확인
 ```
+
+---
+
+## > 운영 배포 시 정리 항목 (Production cleanup)
+
+테스트/디버그용 코드는 **로컬 개발 편의를 위해 리포지토리에 그대로 둡니다.**
+운영(EC2 prod) 배포 시에는 아래 두 가지 방식으로 분리해서 처리합니다.
+
+### A. 자동 처리 — `.dockerignore` 가 컨테이너 빌드에서 자동 제외
+
+다음 파일들은 각 서비스 폴더의 `.dockerignore` 로 처리되어 운영 이미지에 들어가지 않습니다.
+**별도 작업 불필요**, `docker compose up -d --build` 만으로 자동 적용됩니다.
+
+| 파일 | 제외 정의 | 이유 |
+|---|---|---|
+| `services/ingestion/celery_app/test_waf.py` | `celery_app/.dockerignore` (`test_*.py`) | 수동 WAF 페이로드 테스트 스크립트 (SQLi/XSS 페이로드를 Celery에 직접 LPUSH) |
+| `services/aegis-portal-backend/venv/`, `.env`, `__pycache__/` | `aegis-portal-backend/.dockerignore` | 로컬 virtualenv, 자격증명, Python 캐시 |
+| `services/ingestion/celery_app/__pycache__/`, `*.pyc`, `.env` | `celery_app/.dockerignore` | 동일 |
+
+> `.env` 는 deploy.yml 이 GitHub Secrets → 컨테이너 environment 로 별도 주입하므로 운영 이미지에 들어갈 필요가 없습니다.
+
+### B. 수동 처리 — 운영 전환 시 코드/데이터 직접 편집
+
+다음 항목들은 다른 코드가 `import` 하거나 인라인으로 작성돼 있어서
+`.dockerignore` 로 제외할 수 없습니다. **코드 자체를 손봐야 합니다.**
+
+| 파일 | 처리 내용 |
+|---|---|
+| [services/aegis-portal-backend/app/seed_data.py](services/aegis-portal-backend/app/seed_data.py) | 파일 삭제 (더미 로그 생성기) |
+| [services/aegis-portal-backend/app/main.py](services/aegis-portal-backend/app/main.py) | `from .seed_data import generate_logs` import 제거 + `POST /api/seed` 엔드포인트 블록 (현재 84~93줄) 삭제 + docstring의 "길1 전용" 줄 정리 |
+| [services/aegis-portal-backend/app/stream_source.py](services/aegis-portal-backend/app/stream_source.py) | 맨 아래 `event_stream = dummy_stream` → `event_stream = change_stream` 으로 변경. **단, MongoDB가 replica set 모드여야 동작** ([docker-compose.yml](docker-compose.yml) 의 mongodb 서비스에 `command: ["--replSet","rs0"]` 추가 + 최초 1회 `rs.initiate()` 필요) |
+| [proxy/app.js](proxy/app.js) | 13~27줄의 데모 핸들러 (`/` 배너 응답, `/user` 마스킹 테스트 JSON) 삭제 |
+| [data/init.sql](data/init.sql) | `Test Company` 및 `localhost` 테스트 라우트 INSERT 블록 삭제 — 실 고객사는 portal-backend의 `POST /api/customers` 로 등록 |
+
+### C. 이미 EC2에 떠있는 컨테이너 즉시 정리 명령어
+
+`.dockerignore` 변경이 main 에 머지된 후 다음 자동 배포(deploy.yml) 때 자동으로 정리되지만,
+**바로** 정리하고 싶다면 EC2 에서:
+
+```bash
+# 1) [임시] 떠있는 컨테이너 안의 test_waf.py 즉시 삭제
+sudo docker exec aegis-soar-api    rm -f /app/test_waf.py
+sudo docker exec aegis-soar-worker rm -f /app/test_waf.py
+
+# 2) [영구] 새 .dockerignore 가 적용된 이미지로 재빌드
+cd /home/ubuntu/Aegis-3
+git pull origin main
+sudo docker compose up -d --build soar-api soar-worker portal-backend
+
+# 3) [선택] B 항목까지 모두 적용한 상태에서 재빌드하려면
+#    먼저 위 B 표대로 코드를 수정해 커밋한 뒤 git pull → 같은 명령으로 재빌드
+sudo docker compose up -d --build portal-backend proxy nginx
+```
+
+### 정리 체크리스트
+
+운영 첫 배포 직전에 한 번 확인:
+
+- [ ] `services/*/test_*.py`, `*_test.py` 가 컨테이너에 들어가지 않는지 확인:
+      `docker exec aegis-soar-api ls /app/ | grep -i test` → 결과 없어야 함
+- [ ] portal-backend `/api/seed` 호출 시 404 인지 확인 (B 항목 적용됨)
+- [ ] 대시보드에 더미 로그가 아닌 실 SOAR 파이프라인 로그가 흐르는지 확인 (`stream_source.py` 가 change_stream 로 전환됨)
+- [ ] `data/init.sql` 의 `Test Company` 가 운영 DB 에 없는지 확인:
+      `docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "SELECT company_name FROM tenants"`
+- [ ] 노출된 자격증명이 GitHub Secrets / EC2 .env / DB 비밀번호 어디에도 남아있지 않은지 확인
