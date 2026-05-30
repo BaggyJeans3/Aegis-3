@@ -49,7 +49,7 @@ async function sendSecurityEmail(ip, attackType) {
 
     try {
         await transporter.sendMail({
-            from: `"이지스 3 관제시스템" <${EMAIL_USER}>`,
+            from: `"Aegis-3" <${EMAIL_USER}>`,
             to: "baggyjeans2026@gmail.com", 
             subject: `🚨 [긴급] 보안 위협 대응 리포트 (${ip})`,
             html: `
