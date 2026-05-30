@@ -8,6 +8,12 @@ Aegis 포털 백엔드 (FastAPI).
   GET  /api/stats           대시보드용 집계 통계
   GET  /api/tenants         로그에 존재하는 테넌트 목록
   GET  /api/logs/stream     SSE 실시간 로그 스트림
+  POST /api/customers       고객사 등록 (PostgreSQL tenants + routers)
+  GET  /api/customers       특정 회원의 고객사 목록 조회
+
+데이터 저장소:
+  MongoDB    - 트래픽 로그 (database.py)
+  PostgreSQL - 고객사/라우팅 정보 (postgres.py)
 
 ================================================================
 길1 -> 길2 전환 가이드 (나중에 EC2 SOAR 파이프라인이 완성되면)
@@ -28,17 +34,23 @@ from typing import Optional
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from .database import connect_to_mongo, close_mongo_connection, get_collection
-from .seed_data import generate_logs               # [길1 전용]
+from .seed_data import generate_logs       
 from .stream_source import event_stream
+from .postgres import connect_to_postgres, close_postgres_connection
+from .customers import create_customer, list_customers
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 두 DB에 모두 연결: MongoDB(로그) + PostgreSQL(고객사)
     await connect_to_mongo()
+    await connect_to_postgres()
     yield
     await close_mongo_connection()
+    await close_postgres_connection()
 
 
 app = FastAPI(title="Aegis Portal Backend", version="0.2.0", lifespan=lifespan)
@@ -211,3 +223,42 @@ async def logs_stream(tenant_id: Optional[str] = None):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ===== 고객사(테넌트) 관리 - PostgreSQL =====
+
+class CustomerCreate(BaseModel):
+    """고객사 등록 요청 본문. 프론트 ApiManagePage 에서 전송."""
+    company_name: str
+    plan_type: str = "FREE"
+    spec_text: str
+    supabase_user_id: str
+    inbound_domain: str
+    target_origin: str = ""
+
+
+@app.post("/api/customers")
+async def post_customer(payload: CustomerCreate):
+    """
+    고객사 등록. PostgreSQL tenants + routers 에 INSERT.
+    api_key 는 백엔드가 자동 생성.
+
+    참고: 현재 supabase_user_id 는 프론트가 보낸 값을 그대로 신뢰함.
+          JWT 검증은 추후 추가 예정.
+    """
+    customer = await create_customer(
+        company_name=payload.company_name,
+        plan_type=payload.plan_type,
+        spec_text=payload.spec_text,
+        supabase_user_id=payload.supabase_user_id,
+        inbound_domain=payload.inbound_domain,
+        target_origin=payload.target_origin,
+    )
+    return customer
+
+
+@app.get("/api/customers")
+async def get_customers(supabase_user_id: str = Query(...)):
+    """특정 Supabase 회원이 소유한 고객사 목록 조회."""
+    customers = await list_customers(supabase_user_id)
+    return {"customers": customers}

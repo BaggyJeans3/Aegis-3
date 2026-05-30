@@ -169,6 +169,8 @@ services:
       - aegis-net
 
   # 10. 고객사 대시보드 로그 전달용 API 엔진 (FastAPI)
+  #     - MongoDB: 트래픽 로그 조회/스트림
+  #     - PostgreSQL: 고객사(tenants) 등록/조회
   portal-backend:
     build:
       context: ./services/aegis-portal-backend
@@ -181,10 +183,16 @@ services:
       - MONGO_HOST=aegis-mongodb
       - MONGO_PORT=27017
       - MONGO_DB_NAME=aegis_logs
+      - DB_USER=aegis_admin
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_HOST=aegis-postgres
+      - POSTGRES_PORT=5432
+      - DB_NAME=aegis_proxy
     ports:
       - "8001:8001"
     depends_on:
       - mongodb
+      - postgres-db
     networks:
       - aegis-net
 
