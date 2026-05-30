@@ -73,3 +73,17 @@ jobs:
 
             # 도커 실행
             sudo docker compose up -d --build
+
+            # DB 스키마 보강 (볼륨 보존 환경이라 init.sql이 재실행되지 않으므로,
+            # 이미 존재하는 tenants 테이블에 신규 컬럼을 직접 추가)
+            echo "PostgreSQL 컨테이너 준비 대기..."
+            for i in $(seq 1 30); do
+              if sudo docker exec aegis-postgres pg_isready -U aegis_admin -d aegis_proxy; then
+                break
+              fi
+              sleep 2
+            done
+
+            sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS supabase_user_id UUID;"
+            sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS spec_text TEXT;"
+            sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "CREATE INDEX IF NOT EXISTS idx_tenants_supabase_user ON tenants(supabase_user_id);"
