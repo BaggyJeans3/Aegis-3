@@ -111,3 +111,21 @@ async def list_customers(supabase_user_id: str) -> list:
         }
         for r in rows
     ]
+
+
+async def list_owned_tenant_ids(supabase_user_id: str) -> list[str]:
+    """
+    특정 회원이 소유한 tenant_id 문자열 목록만 반환.
+    멀티 테넌트 로그 필터링에 사용 (일반 사용자가 자기 로그만 보게).
+    """
+    try:
+        su_id = uuid.UUID(supabase_user_id)
+    except (ValueError, AttributeError, TypeError):
+        return []
+
+    pool = get_pool()
+    rows = await pool.fetch(
+        "SELECT tenant_id FROM tenants WHERE supabase_user_id = $1",
+        su_id,
+    )
+    return [str(r["tenant_id"]) for r in rows]

@@ -2,14 +2,19 @@
 Aegis 포털 백엔드 (FastAPI).
 
 엔드포인트:
-  GET  /api/health          헬스 체크
-  POST /api/seed            더미 로그 삽입   [길1 전용 - 길2 전환 시 삭제]
-  GET  /api/logs            로그 목록 조회 (필터 + 페이지네이션)
-  GET  /api/stats           대시보드용 집계 통계
-  GET  /api/tenants         로그에 존재하는 테넌트 목록
-  GET  /api/logs/stream     SSE 실시간 로그 스트림
-  POST /api/customers       고객사 등록 (PostgreSQL tenants + routers)
-  GET  /api/customers       특정 회원의 고객사 목록 조회
+  GET  /api/health          헬스 체크 (인증 불필요)
+  POST /api/seed            더미 로그 삽입 [길1 전용 - 길2 전환 시 삭제]
+  POST /api/customers       고객사 등록 (admin/customer 둘 다)
+  GET  /api/customers       본인 고객사 목록 조회
+  GET  /api/logs            로그 목록 (admin=전체 / customer=본인 tenant)
+  GET  /api/stats           통계 (admin=전체 / customer=본인 tenant)
+  GET  /api/tenants         테넌트 드롭다운 목록 (admin/customer 분기)
+  GET  /api/logs/stream     SSE 실시간 (admin/customer 분기)
+
+권한 정책:
+  - 모든 /api/* (health/seed 제외)는 JWT 인증 필수
+  - admin (app_metadata.user_role == "ADMIN") -> 전체 데이터
+  - customer (그 외)                          -> 본인 소유 tenant_id 로만 필터
 
 데이터 저장소:
   MongoDB    - 트래픽 로그 (database.py)
@@ -21,8 +26,6 @@ Aegis 포털 백엔드 (FastAPI).
   1. seed_data.py 파일 삭제
   2. 아래 @app.post("/api/seed") 블록 삭제
   3. stream_source.py 의 dummy_stream() -> change_stream() 으로 교체
-     (MongoDB Change Stream 사용. replica set 모드 필요)
-  그 외 /api/logs, /api/stats, 프론트 코드는 그대로 둠.
 ================================================================
 """
 import asyncio
@@ -31,16 +34,17 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .database import connect_to_mongo, close_mongo_connection, get_collection
-from .seed_data import generate_logs       
+from .seed_data import generate_logs               # [길1 전용]
 from .stream_source import event_stream
 from .postgres import connect_to_postgres, close_postgres_connection
-from .customers import create_customer, list_customers
+from .customers import create_customer, list_customers, list_owned_tenant_ids
+from .auth import get_current_user, get_auth_context, AuthContext
 
 
 @asynccontextmanager
@@ -49,11 +53,11 @@ async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await connect_to_postgres()
     yield
-    await close_mongo_connection()
     await close_postgres_connection()
+    await close_mongo_connection()
 
 
-app = FastAPI(title="Aegis Portal Backend", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="Aegis Portal Backend", version="0.3.0", lifespan=lifespan)
 
 # Vite 프론트(개발 서버)에서 호출 가능하도록 CORS 허용.
 # 운영 시에는 allow_origins를 실제 프론트 도메인으로 좁힐 것.
@@ -76,15 +80,66 @@ def _serialize(doc: dict) -> dict:
     return doc
 
 
+async def _resolve_tenant_filter(
+    ctx: AuthContext, requested_tenant_id: Optional[str]
+) -> Optional[dict]:
+    """
+    권한에 따라 MongoDB 쿼리에 추가할 tenant 필터를 결정.
+
+    반환값:
+      None      -> 필터 없음 (admin이 전체 조회할 때)
+      {...}     -> MongoDB 쿼리 조각. caller가 query에 병합해 쓰면 됨.
+
+    규칙:
+      - admin + tenant_id 지정 -> 그 tenant 만
+      - admin + 미지정         -> 전체 (필터 없음)
+      - customer               -> 본인 소유 tenant_id 들 (요청값은 본인 소유에 한해서만 적용)
+    """
+    if ctx.is_admin:
+        if requested_tenant_id:
+            return {"subject.tenant_id": requested_tenant_id}
+        return None  # 전체
+
+    # customer: 본인 소유 tenant 만
+    owned = await list_owned_tenant_ids(ctx.user_id)
+    if not owned:
+        # 등록한 고객사가 없으면 어떤 로그도 못 봄
+        return {"subject.tenant_id": {"$in": []}}  # 0개 매칭
+
+    if requested_tenant_id:
+        # 요청한 tenant 가 본인 소유인지 확인
+        if requested_tenant_id not in owned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="해당 tenant 에 접근 권한이 없습니다.",
+            )
+        return {"subject.tenant_id": requested_tenant_id}
+
+    # tenant 지정 안 했으면 본인 소유 전체
+    return {"subject.tenant_id": {"$in": owned}}
+
+
 @app.get("/api/health")
 async def health():
+    """헬스 체크. 인증 불필요."""
     return {"status": "ok", "service": "aegis-portal-backend"}
 
 
 # ===== [길1 전용] 더미 시드 - 길2 전환 시 이 블록 삭제 =====
 @app.post("/api/seed")
-async def seed(count: int = Query(200, ge=1, le=2000)):
-    """더미 로그를 MongoDB에 채움. 기존 데이터는 비우고 새로 삽입."""
+async def seed(
+    count: int = Query(200, ge=1, le=2000),
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """
+    더미 로그를 MongoDB에 채움. 기존 데이터는 비우고 새로 삽입.
+    admin 만 허용 (테스트 데이터 조작 권한).
+    """
+    if not ctx.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin 권한이 필요합니다.",
+        )
     coll = get_collection()
     await coll.delete_many({})
     logs = generate_logs(count)
@@ -102,16 +157,24 @@ async def get_logs(
     search: Optional[str] = Query(None, description="path 부분 일치 검색"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    ctx: AuthContext = Depends(get_auth_context),
 ):
     """
-    로그 목록 조회. 모든 필터는 선택 사항.
-    멀티 테넌트: tenant_id를 주면 해당 고객사 로그만 반환.
+    로그 목록 조회 (인증 필수).
+      - admin: 모든 로그. tenant_id 주면 그 고객사 한정.
+      - customer: 본인 소유 tenant_id 로 자동 필터링.
+        본인 소유 아닌 tenant_id 를 명시하면 403.
     """
     coll = get_collection()
 
     query: dict = {}
-    if tenant_id:
-        query["subject.tenant_id"] = tenant_id
+
+    # 권한 기반 tenant 필터
+    tenant_filter = await _resolve_tenant_filter(ctx, tenant_id)
+    if tenant_filter:
+        query.update(tenant_filter)
+
+    # 그 외 일반 필터
     if action:
         query["security_analysis.action"] = action
     if min_risk > 0.0:
@@ -142,12 +205,21 @@ async def get_logs(
 
 
 @app.get("/api/stats")
-async def get_stats(tenant_id: Optional[str] = None):
-    """대시보드 카드/차트용 집계."""
+async def get_stats(
+    tenant_id: Optional[str] = None,
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """
+    대시보드 통계 (인증 필수).
+      - admin: 전체 통계. tenant_id 주면 그 고객사만.
+      - customer: 본인 소유 tenant 로 자동 필터링.
+    """
     coll = get_collection()
     match: dict = {}
-    if tenant_id:
-        match["subject.tenant_id"] = tenant_id
+
+    tenant_filter = await _resolve_tenant_filter(ctx, tenant_id)
+    if tenant_filter:
+        match.update(tenant_filter)
 
     base = [{"$match": match}] if match else []
 
@@ -191,26 +263,62 @@ async def get_stats(tenant_id: Optional[str] = None):
 
 
 @app.get("/api/tenants")
-async def get_tenants():
-    """로그에 등장하는 테넌트 목록 (프론트 필터 드롭다운용)."""
-    coll = get_collection()
-    tenants = await coll.distinct("subject.tenant_id")
-    return {"tenants": sorted(tenants)}
+async def get_tenants(ctx: AuthContext = Depends(get_auth_context)):
+    """
+    드롭다운용 tenant 목록 (인증 필수).
+      - admin: MongoDB 로그에 등장하는 모든 tenant_id
+      - customer: 본인이 소유한 tenant_id 만 (로그 유무 무관)
+    """
+    if ctx.is_admin:
+        coll = get_collection()
+        tenants = await coll.distinct("subject.tenant_id")
+        return {"tenants": sorted(tenants)}
+    # customer: PostgreSQL에서 본인 소유 가져옴
+    owned = await list_owned_tenant_ids(ctx.user_id)
+    return {"tenants": sorted(owned)}
 
 
 @app.get("/api/logs/stream")
-async def logs_stream(tenant_id: Optional[str] = None):
+async def logs_stream(
+    tenant_id: Optional[str] = None,
+    ctx: AuthContext = Depends(get_auth_context),
+):
     """
-    SSE 실시간 로그 스트림.
-    프론트는 EventSource로 이 엔드포인트를 구독.
+    SSE 실시간 로그 스트림 (인증 필수).
 
-    데이터 소스는 stream_source.py 가 담당:
-      - 길1(지금): 더미 로그를 주기적으로 생성해서 푸시
-      - 길2(나중): MongoDB Change Stream 으로 교체
-    이 엔드포인트 자체는 길2 전환 시에도 바뀌지 않음.
+    주의: 브라우저의 EventSource 는 커스텀 헤더(Authorization)를 못 보냄.
+    프론트에서는 토큰을 쿼리 파라미터로 보내거나(보안 약함),
+    fetch-기반 SSE 라이브러리를 사용해야 함. 지금은 일단 동작 우선.
+
+    권한:
+      - admin: tenant_id 지정 가능. 미지정 시 전체.
+      - customer: 본인 소유 외 tenant_id 는 403.
     """
+    # 권한 사전 검증 (stream 시작 후엔 에러 응답이 어려움)
+    resolved_tenant: Optional[str] = None
+    if ctx.is_admin:
+        resolved_tenant = tenant_id
+    else:
+        owned = await list_owned_tenant_ids(ctx.user_id)
+        if not owned:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="등록된 고객사가 없어 스트림 접근 불가.",
+            )
+        if tenant_id:
+            if tenant_id not in owned:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="해당 tenant 에 접근 권한이 없습니다.",
+                )
+            resolved_tenant = tenant_id
+        else:
+            # tenant 지정 안 했으면 첫 번째 소유 tenant 로 스트림
+            # (여러 tenant 동시 스트리밍은 현재 stream_source 인터페이스 한 개 인자만 지원)
+            resolved_tenant = owned[0]
+
     async def gen():
-        async for log in event_stream(tenant_id):
+        async for log in event_stream(resolved_tenant):
             yield f"data: {json.dumps(log, default=str)}\n\n"
             await asyncio.sleep(0)
 
@@ -228,29 +336,39 @@ async def logs_stream(tenant_id: Optional[str] = None):
 # ===== 고객사(테넌트) 관리 - PostgreSQL =====
 
 class CustomerCreate(BaseModel):
-    """고객사 등록 요청 본문. 프론트 ApiManagePage 에서 전송."""
+    """
+    고객사 등록 요청 본문.
+    supabase_user_id 는 JWT 토큰에서 추출하므로 본문에 받지 않음.
+    """
     company_name: str
     plan_type: str = "FREE"
     spec_text: str
-    supabase_user_id: str
     inbound_domain: str
     target_origin: str = ""
 
 
 @app.post("/api/customers")
-async def post_customer(payload: CustomerCreate):
+async def post_customer(
+    payload: CustomerCreate,
+    user: dict = Depends(get_current_user),
+):
     """
     고객사 등록. PostgreSQL tenants + routers 에 INSERT.
     api_key 는 백엔드가 자동 생성.
-
-    참고: 현재 supabase_user_id 는 프론트가 보낸 값을 그대로 신뢰함.
-          JWT 검증은 추후 추가 예정.
+    admin/customer 둘 다 자기 명의로 등록 가능.
     """
+    supabase_user_id = user.get("sub")
+    if not supabase_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="토큰에 sub 클레임 없음",
+        )
+
     customer = await create_customer(
         company_name=payload.company_name,
         plan_type=payload.plan_type,
         spec_text=payload.spec_text,
-        supabase_user_id=payload.supabase_user_id,
+        supabase_user_id=supabase_user_id,
         inbound_domain=payload.inbound_domain,
         target_origin=payload.target_origin,
     )
@@ -258,7 +376,16 @@ async def post_customer(payload: CustomerCreate):
 
 
 @app.get("/api/customers")
-async def get_customers(supabase_user_id: str = Query(...)):
-    """특정 Supabase 회원이 소유한 고객사 목록 조회."""
+async def get_customers(user: dict = Depends(get_current_user)):
+    """
+    현재 로그인한 회원이 소유한 고객사 목록.
+    인증 토큰의 sub 클레임으로 본인 데이터만 반환.
+    """
+    supabase_user_id = user.get("sub")
+    if not supabase_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="토큰에 sub 클레임 없음",
+        )
     customers = await list_customers(supabase_user_id)
     return {"customers": customers}

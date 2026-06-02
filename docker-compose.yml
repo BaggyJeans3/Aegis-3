@@ -194,6 +194,10 @@ services:
       - POSTGRES_HOST=aegis-postgres
       - POSTGRES_PORT=5432
       - DB_NAME=aegis_proxy
+      # Supabase JWT 인증 (값은 .env -> GitHub Secrets 에서 주입)
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      - SUPABASE_JWT_AUDIENCE=${SUPABASE_JWT_AUDIENCE:-authenticated}
     ports:
       - "8001:8001"
     depends_on:
