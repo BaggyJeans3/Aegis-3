@@ -9,6 +9,9 @@ from pymongo import MongoClient
 from celery_app import celery_app, redis_client
 from ai_engine import generate_waf_rule_with_feedback
 
+import re
+import hashlib
+
 
 # ============================================================
 # Worker 설정
@@ -41,6 +44,44 @@ NGINX_SIDECAR_URL = os.getenv(
     "NGINX_SIDECAR_URL",
     "http://nginx:4000/api/v1/rules/inject"
 )
+
+
+# ============================================================
+# [Aegis-3 SOAR] 작업 7 — 공격 클러스터링
+# 비슷한 공격 패턴은 LLM 재호출 없이 캐시된 결과 재사용
+# ============================================================
+
+CLUSTER_TTL_SECONDS = int(os.getenv("CLUSTER_TTL_SECONDS", "300"))  # 5분
+
+
+def normalize_attack_log(raw_event: dict) -> str:
+    """
+    공격 로그에서 IP·세션·타임스탬프 등 변동 요소를 제거하고
+    공격 패턴의 본질만 남긴 정규화 문자열을 반환한다.
+    """
+    method = (raw_event.get("method") or "").upper()
+    path = (raw_event.get("path") or "").lower()
+    query = (raw_event.get("query") or "").lower()
+    body = (raw_event.get("body") or "").lower()
+    ua = (raw_event.get("headers", {}).get("user-agent") or "").lower()
+
+    text = f"{method} {path}?{query} body={body} ua={ua}"
+
+    # 숫자 → N  (id=123, id=999 같은 변동값 통일)
+    text = re.sub(r"\d+", "N", text)
+    # 긴 16진수/UUID → X  (세션 토큰, 해시값 통일)
+    text = re.sub(r"[a-f0-9]{16,}", "X", text)
+    # 연속 공백 정리
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def compute_cluster_key(raw_event: dict) -> str:
+    """정규화된 공격 로그의 SHA256 앞 16자로 클러스터 키 생성."""
+    normalized = normalize_attack_log(raw_event)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return f"aegis:cluster:{digest}"
 
 
 def normalize_redis_log(log_data):
@@ -255,9 +296,46 @@ def process_security_log(self, log_data):
                 except Exception as redis_err:
                     print(f"[Worker] ⚠️ Redis EXISTS 실패: {redis_err} — fail-open으로 LLM 진행")
 
+            # ──────────────────────────────────────────────────────────
+            # [Aegis-3 SOAR] 작업 7 — 공격 클러스터 캐시 체크
+            # 정규화된 패턴이 5분 내 이미 처리됐으면 LLM 재호출 없이 결과 재사용
+            # Redis 장애 시 fail-open
+            # ──────────────────────────────────────────────────────────
+            cluster_key = compute_cluster_key(raw_event)
+            try:
+                cached_rule_name = redis_client.get(cluster_key)
+                if cached_rule_name:
+                    try:
+                        redis_client.incr("aegis:stats:cluster_skipped")
+                    except Exception:
+                        pass
+                    print(f"[Worker] ♻️ 클러스터 캐시 hit ({cluster_key}) — LLM 호출 skip, 기존 룰 재사용: {cached_rule_name}")
+                    return {
+                        "status": "success",
+                        "event_id": raw_event.get("event_id"),
+                        "risk_score": risk_score,
+                        "level": detection_result.get("level"),
+                        "llm_skipped": True,
+                        "reason": "cluster_cache_hit",
+                        "cached_rule": cached_rule_name,
+                    }
+            except Exception as redis_err:
+                print(f"[Worker] ⚠️ 클러스터 캐시 조회 실패: {redis_err} — fail-open으로 LLM 진행")
+
             # LLM 호출 (기존 로직)
             print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
             ai_rule = generate_waf_rule_with_feedback(raw_event)
+
+            # ──────────────────────────────────────────────────────────
+            # [Aegis-3 SOAR] 작업 7 — 클러스터 캐시 저장
+            # 다음 5분 안에 같은 패턴이 다시 오면 LLM 재호출 회피
+            # ──────────────────────────────────────────────────────────
+            if ai_rule and ai_rule.get("rule_name"):
+                try:
+                    redis_client.setex(cluster_key, CLUSTER_TTL_SECONDS, ai_rule.get("rule_name"))
+                    print(f"[Worker] 📌 클러스터 캐시 저장 ({cluster_key}, TTL {CLUSTER_TTL_SECONDS}s): {ai_rule.get('rule_name')}")
+                except Exception as redis_err:
+                    print(f"[Worker] ⚠️ 클러스터 캐시 저장 실패: {redis_err}")
 
             # LLM 호출 후 IP를 24h 블랙리스트 등록 (성공/실패 모두)
             # — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊을 수 있도록
