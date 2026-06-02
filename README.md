@@ -6,7 +6,7 @@
 
 ---
 
-## > 현재 시스템 아키텍처 및 데이터 흐름
+## 현재 시스템 아키텍처 및 데이터 흐름 (진행중)
 
 ```text
   [공격자/사용자 요청]
@@ -58,6 +58,19 @@
 │  ├─ Slack Bolt App  (#security-alerts)               │
 │  └─ nodemailer (SMTP HTML 보고서)                     │
 └──────────────────────────────────────────────────────┘
+
+      [대시보드 조회 경로 — 고객사/관리자용]
+   MongoDB(로그) ─┐
+                 ▼
+┌──────────────────────────────────────────────────────┐
+│      Aegis Portal Backend (Port 8001, FastAPI)       │
+│  ├─ Supabase JWT 인증 (JWKS 검증 + role 판별)         │
+│  ├─ 테넌트 격리 (admin=전체 / customer=본인 tenant)   │
+│  ├─ 로그/통계/SSE 실시간 스트림 조회                  │
+│  └─ 고객사(tenant) 등록·조회 (PostgreSQL)             │
+└──────────────────────────────────────────────────────┘
+                 ▲
+   PostgreSQL(고객사) ─┘
 ```
 
 ---
@@ -96,6 +109,12 @@
    - **Cloudflare WAF 연동:** 공격 IP에 대한 Cloudflare 방화벽 차단 API를 호출하여 해당 IP를 네트워크 엣지 단에서 영구 격리합니다.
    - **Slack 연동:** Slack Bolt 소켓 기반의 실시간 경보 메시지를 `#security-alerts` 관제 채널에 포맷팅하여 전송합니다.
    - **Email 연동:** SMTP 프로토콜을 통하여 관제 담당자의 편지함에 직관적이고 미려한 HTML 위협 분석 보고서를 발송합니다.
+
+8. **고객사 대시보드 백엔드 (Aegis Portal Backend, FastAPI)**
+   - MongoDB(트래픽 로그)와 PostgreSQL(고객사/라우팅 정보)을 함께 조회하여 대시보드용 로그 목록·통계·실시간(SSE) 스트림 API를 제공합니다.
+   - **Supabase JWT 인증:** 모든 `/api/*` 요청을 Supabase JWKS(공개키)로 서명 검증하고, `user_profiles` 테이블에서 role 을 조회(5분 캐시)하여 권한을 판별합니다.
+   - **멀티테넌트 격리:** `admin` 은 전체 데이터, `customer` 는 본인 소유 `tenant_id` 로만 자동 필터링되어 타 고객사 로그 접근을 차단합니다.
+   - **고객사 등록:** `POST /api/customers` 로 tenants/routers 테이블에 등록하며 `api_key` 를 자동 생성합니다.
 
 ---
 
@@ -139,11 +158,23 @@ Aegis-3/
         │   ├── tasks.py            # process_security_log: Risk→Mongo→AI→사이드카 주입
         │   ├── ai_engine.py        # Gemini 2.5 Flash 호출 + JSON 강제 + 피드백 루프
         │   └── requirements.txt
-        └── analyzer/               # Node.js 기반 실시간 알림/차단 자동 대응 엔진
+        ├── analyzer/               # Node.js 기반 실시간 알림/차단 자동 대응 엔진
+        │   ├── Dockerfile
+        │   ├── analyzer.js         # 슬랙, 이메일(SMTP), Cloudflare API 처리 엔진 본체
+        │   ├── .env                # 이메일/슬랙/Cloudflare 연동용 자격증명 저장소
+        │   └── package.json
+        └── aegis-portal-backend/   # 고객사 대시보드 로그/통계 조회 API (FastAPI, :8001)
             ├── Dockerfile
-            ├── analyzer.js         # 슬랙, 이메일(SMTP), Cloudflare API 처리 엔진 본체
-            ├── .env                # 이메일/슬랙/Cloudflare 연동용 자격증명 저장소
-            └── package.json
+            ├── requirements.txt
+            ├── .env.example        # 로컬 테스트용 환경변수 템플릿 (.env 는 커밋 금지)
+            └── app/
+                ├── main.py         # FastAPI 엔드포인트 (로그/통계/SSE/고객사)
+                ├── auth.py         # Supabase JWT 검증 + role(user_profiles) 판별
+                ├── customers.py    # 고객사(tenant) 등록·조회, 소유 tenant_id 필터
+                ├── database.py     # MongoDB 연결 (트래픽 로그)
+                ├── postgres.py     # PostgreSQL 연결 (고객사/라우팅 정보)
+                ├── seed_data.py    # [길1 전용] 더미 로그 생성기 (운영 시 삭제)
+                └── stream_source.py # SSE 스트림 소스 (dummy → change_stream 전환)
 ```
 
 ---
@@ -188,13 +219,28 @@ Aegis-3/
   ```
   > **Tip (Gmail SMTP):** 구글 메일 연동 시, 2단계 인증을 활성화한 후 구글 계정 보안 페이지에서 생성한 **공백(띄어쓰기)이 완전히 제거된 16자리 앱 비밀번호**를 기입해야 구글 서버 인증에 성공합니다.
 
+* **대시보드 백엔드 Supabase 인증 (`./.env` — portal-backend 가 컨테이너 environment 로 주입받음):**
+  ```env
+  # Supabase 프로젝트 URL (JWKS 공개키 + REST API 공통)
+  SUPABASE_URL=https://<프로젝트_ref>.supabase.co
+
+  # user_profiles 조회용 Service Role Key (RLS 우회, 절대 외부 노출 금지)
+  SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
+
+  # 선택: 토큰 aud 값. 기본 authenticated (보통 변경 불필요)
+  # SUPABASE_JWT_AUDIENCE=authenticated
+  ```
+  > **Note:** 로컬 테스트는 `services/aegis-portal-backend/.env.example` 을 복사해 `.env` 로 채우면 됩니다.
+  > 운영(EC2)에서는 `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` 를 **GitHub Secrets** 에 등록하면 `deploy.yml` 이 `.env` 로 생성하고 docker-compose 가 portal-backend 컨테이너에 주입합니다.
+  > `SUPABASE_JWT_AUDIENCE` 는 비밀이 아니므로 Secrets 에 넣지 않으며, 미설정 시 compose 기본값 `authenticated` 가 사용됩니다.
+
 ### 3. 전체 시스템 빌드 및 컨테이너 가동
 ```bash
 docker compose up -d --build
 ```
-모든 다중 서비스들(nginx + 사이드카, proxy, postgres, redis, mongodb, soar-api, soar-worker + Beat, detection-engine, analyzer)이 Docker 가상 컴퓨터 위에서 부팅되어 완벽한 고립 네트워크 상태로 작동됩니다.
+모든 다중 서비스들(nginx + 사이드카, proxy, postgres, redis, mongodb, soar-api, soar-worker + Beat, detection-engine, analyzer, portal-backend)이 Docker 가상 컴퓨터 위에서 부팅되어 완벽한 고립 네트워크 상태로 작동됩니다.
 
-> **첫 빌드 시간:** libcoraza + coraza-nginx 모듈 컴파일 때문에 처음에는 5~10분이 걸리지만, 이후에는 캐시 덕분에 수십 초 안에 끝납니다.
+> **첫 빌드 시간:** libcoraza + coraza-nginx 모듈 컴파일 때문에 5~10분이 걸릴 수 있습니다. 
 
 ### 4. End-to-End 동작 확인 (선택)
 ```bash
