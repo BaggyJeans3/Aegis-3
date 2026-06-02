@@ -4,6 +4,7 @@
   "private": true,
   "main": "sidecar.js",
   "dependencies": {
-    "express": "^4.21.0"
+    "express": "^4.21.0",
+    "tail": "^2.2.6"
   }
 }
