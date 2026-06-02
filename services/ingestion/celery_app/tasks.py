@@ -227,8 +227,47 @@ def process_security_log(self, log_data):
         detection_result = analyzer_result.get("detection_result", {})
         risk_score = int(detection_result.get("risk_score") or 0)
         if risk_score >= AI_RULE_THRESHOLD:
+            # ──────────────────────────────────────────────────────────
+            # [Aegis-3 SOAR] IP 평판 — 작업 6-A
+            # LLM 호출 전 블랙리스트 체크: 24시간 내 이미 악성 판정된 IP면
+            # LLM 재호출 없이 즉시 스킵 (비용·할당량 절감)
+            # Redis 장애 시 fail-open — 정상 분석은 계속 진행
+            # ──────────────────────────────────────────────────────────
+            ip = raw_event.get("ip")
+            blacklist_key = f"aegis:blacklist:{ip}" if ip and ip != "unknown" else None
+
+            if blacklist_key:
+                try:
+                    if redis_client.exists(blacklist_key):
+                        try:
+                            redis_client.incr("aegis:stats:llm_skipped")
+                        except Exception:
+                            pass
+                        print(f"[Worker] 🛑 IP {ip} blacklist hit — LLM 호출 skip")
+                        return {
+                            "status": "success",
+                            "event_id": raw_event.get("event_id"),
+                            "risk_score": risk_score,
+                            "level": detection_result.get("level"),
+                            "llm_skipped": True,
+                            "reason": "ip_blacklisted",
+                        }
+                except Exception as redis_err:
+                    print(f"[Worker] ⚠️ Redis EXISTS 실패: {redis_err} — fail-open으로 LLM 진행")
+
+            # LLM 호출 (기존 로직)
             print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
             ai_rule = generate_waf_rule_with_feedback(raw_event)
+
+            # LLM 호출 후 IP를 24h 블랙리스트 등록 (성공/실패 모두)
+            # — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊을 수 있도록
+            if blacklist_key:
+                try:
+                    redis_client.setex(blacklist_key, 86400, "1")
+                    print(f"[Worker] 🔒 IP {ip} blacklist 등록 (TTL 24h)")
+                except Exception as redis_err:
+                    print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
+
             if ai_rule and ai_rule.get("regex"):
                 print(f"[Worker] ✅ AI 룰 생성됨: {ai_rule.get('rule_name')} (confidence={ai_rule.get('confidence_score')})")
                 _inject_rule_to_nginx(ai_rule)
