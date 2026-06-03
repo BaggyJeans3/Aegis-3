@@ -29,6 +29,21 @@ services:
       - TTL_SECONDS=60 # 1분 무매칭이면 삭제 
       - CLEANUP_INTERVAL=10
 
+  # 1-T. [검증 전용] 마스킹 5×4 매트릭스 모의 백엔드
+  #   nginx /__masking_test__/ 가 이 컨테이너로 프록시한다. 표준 라이브러리만
+  #   사용하므로 빌드 불필요(python slim 이미지 + 스크립트 bind mount). 포트는
+  #   외부로 노출하지 않아 다른 서비스와 충돌하지 않는다. 운영 트래픽과 무관.
+  mock-backend:
+    image: python:3.12-slim
+    container_name: aegis-mock-backend
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./tests/masking/mock_backend.py:/app/mock_backend.py:ro
+    command: python /app/mock_backend.py
+    networks:
+      - aegis-net
+
   # 2. 프록시 서버 (Node.js)
   proxy:
     build:
