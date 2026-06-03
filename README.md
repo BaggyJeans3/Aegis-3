@@ -51,11 +51,12 @@
                                        (Coraza dynamic.conf 적재
                                         → nginx reload → 즉시 차단)
 
-      [Analyzer 경로 — Slack/CF/Email 알림은 향후 연동 예정]
+      [Analyzer 경로 — Slack/CF/Email 대응 + 슬랙 ChatOps 명령어]
 ┌──────────────────────────────────────────────────────┐
 │        Aegis-3 Analyzer (Port 3000/5000, Node.js)    │
-│  ├─ Cloudflare WAF Block API                         │
-│  ├─ Slack Bolt App  (#security-alerts)               │
+│  ├─ Cloudflare WAF Block / Unblock API               │
+│  ├─ Slack Bolt App (Socket Mode, #security-alerts)   │
+│  ├─ ChatOps: 차단해제 / 룰목록 / 룰비활성 / 보고     │
 │  └─ nodemailer (SMTP HTML 보고서)                     │
 └──────────────────────────────────────────────────────┘
 
@@ -109,8 +110,16 @@
 
 7. **실시간 관제 및 긴급 오케스트레이션 (Analyzer)**
    - **Cloudflare WAF 연동:** 공격 IP에 대한 Cloudflare 방화벽 차단 API를 호출하여 해당 IP를 네트워크 엣지 단에서 영구 격리합니다.
-   - **Slack 연동:** Slack Bolt 소켓 기반의 실시간 경보 메시지를 `#security-alerts` 관제 채널에 포맷팅하여 전송합니다.
+   - **Slack 연동:** Slack Bolt **소켓 모드(Socket Mode)** 기반의 실시간 경보 메시지를 `#security-alerts` 관제 채널에 포맷팅하여 전송합니다.
+   - **Slack 대화형 명령어 (ChatOps):** 관제 담당자가 슬랙 채널에서 봇에게 직접 명령하여 즉시 대응할 수 있습니다.
+     | 명령어 | 동작 |
+     |---|---|
+     | `차단해제 <IP>` | 해당 IP의 Cloudflare 차단 룰을 찾아 해제 (IPv4 형식 검증 후 삭제된 rule id 회신) |
+     | `룰목록` | 사이드카 `GET /api/v1/rules` 로 현재 `dynamic.conf` 에 주입된 AI 룰 ID·본문을 조회 (최대 20개 표시) |
+     | `룰비활성 <id>` | 사이드카 `POST /api/v1/rules/revoke/:id` 로 지정 룰을 제거 (Shadow/Live 메모리 상태까지 정리) |
+     | `보고` | 현재까지의 탐지 내역을 종합한 HTML 이메일 보고서를 수동 발송 |
    - **Email 연동:** SMTP 프로토콜을 통하여 관제 담당자의 편지함에 직관적이고 미려한 HTML 위협 분석 보고서를 발송합니다.
+   - **리포트 수신:** `:5000` 의 `POST /api/v1/report` 로 파이프라인의 위협 리포트를 수신합니다.
 
 8. **고객사 대시보드 백엔드 (Aegis Portal Backend, FastAPI)**
    - MongoDB(트래픽 로그)와 PostgreSQL(고객사/라우팅 정보)을 함께 조회하여 대시보드용 로그 목록·통계·실시간(SSE) 스트림 API를 제공합니다.
@@ -223,10 +232,16 @@ Aegis-3/
   ZONE_ID=your_cloudflare_zone_id
   SLACK_BOT_TOKEN=xoxb-your-slack-bot-token
   SLACK_SIGNING_SECRET=your-slack-signing-secret
+  SLACK_APP_TOKEN=xapp-your-slack-app-level-token
   EMAIL_USER=your-smtp-sender@gmail.com
   EMAIL_PASS=your-smtp-16-digit-app-password
+
+  # 선택: 슬랙 명령어가 호출할 사이드카 베이스 URL. 기본 http://nginx:4000
+  # (PC 로컬 단독 테스트 시에만 http://localhost:4000 등으로 덮어쓰기)
+  # SIDECAR_BASE_URL=http://nginx:4000
   ```
   > **Tip (Gmail SMTP):** 구글 메일 연동 시, 2단계 인증을 활성화한 후 구글 계정 보안 페이지에서 생성한 **공백(띄어쓰기)이 완전히 제거된 16자리 앱 비밀번호**를 기입해야 구글 서버 인증에 성공합니다.
+  > **Note (Slack Socket Mode):** 대화형 명령어(`차단해제`/`룰목록`/`룰비활성`/`보고`)는 **소켓 모드**로 동작하므로 Slack 앱 설정에서 **Socket Mode 활성화 + App-Level Token(`xapp-...`) 발급**이 필요하며, 이 값을 `SLACK_APP_TOKEN` 에 넣어야 합니다. 미설정 시 analyzer 컨테이너가 기동에 실패합니다. 운영(EC2)에서는 **GitHub Secrets** 에 `SLACK_APP_TOKEN` 을 등록하면 `deploy.yml` 이 자동 주입합니다.
 
 * **대시보드 백엔드 Supabase 인증 (`./.env` — portal-backend 가 컨테이너 environment 로 주입받음):**
   ```env

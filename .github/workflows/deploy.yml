@@ -60,6 +60,7 @@ jobs:
             SLACK_SIGNING_SECRET=${{ secrets.SLACK_SIGNING_SECRET }}
             EMAIL_USER=${{ secrets.EMAIL_USER }}
             EMAIL_PASS=${{ secrets.EMAIL_PASS }}
+            SLACK_APP_TOKEN=${{ secrets.SLACK_APP_TOKEN }}
             EOF
 
             # 기존 컨테이너 중지 (실행 중인 이미지를 prune하기 위해 필수)
