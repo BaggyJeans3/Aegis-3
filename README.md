@@ -13,10 +13,10 @@
           │
           ▼
 ┌──────────────────────────────────────────────────────┐
-│                  Nginx + Coraza WAF                  │ (Port 80)
-│  ├─ ngx_http_coraza_module                           │ (CRS + custom + AI dynamic 룰 차단)
+│                  Nginx + Coraza WAF                  │ (Port 80, 2-pass)
+│  ├─ [Pass1 :80 ] coraza on  (ngx_http_coraza_module) │ (CRS + custom + AI dynamic 룰 차단)
+│  ├─ [Pass2 :8081] coraza off + subs_filter (regex)   │ (전화/주민/카드/이메일 마스킹 전담)
 │  ├─ /etc/nginx/rules/dynamic.conf                    │ (AI 가 적재한 SecRule 영속 저장)
-│  ├─ ngx_http_sub_module                              │ (전화번호/주민번호 정규식 마스킹)
 │  └─ Sidecar API :4000  /api/v1/rules/inject          │ (Worker → 룰 주입 + nginx -s reload)
 └──────────────────────────┬───────────────────────────┘
                            │ (proxy_pass)
@@ -81,8 +81,10 @@
    - Coraza WAF가 Nginx 동적 모듈로 삽입되어 SQL Injection, XSS, Path Traversal 등의 위협을 실시간 탐지하고 차단합니다.
    - 공식 **OWASP CRS (Core Rule Set)** 및 Aegis-3 전용 커스텀 정책 룰셋을 원격 통합 관리합니다.
 
-2. **개인정보 자동 마스킹 (Nginx Sub Filter)**
-   - 백엔드 응답 본문 내에 노출된 전화번호(`010-XXXX-XXXX`), 주민등록번호 등 민감 정보를 Nginx의 `sub_filter` 모듈로 가로채 `010-9999-****` 등의 안전한 마스크 형태로 실시간 치환하여 개인정보 유출을 원천 봉쇄합니다.
+2. **개인정보 자동 마스킹 (Nginx subs_filter 정규식 + 2-pass 구조)**
+   - 백엔드 응답 본문에 노출된 **전화번호·주민등록번호·카드번호·이메일**을 `ngx_http_substitutions_filter_module` 의 **PCRE 정규식**으로 가로채, 형식은 유지하고 값만 가리는 형태로 실시간 치환합니다 (예: `010-1234-5678` → `010-****-****`, `900101-1234567` → `900101-1******`, `1234-5678-9012-3456` → `****-****-****-3456`, `user@example.com` → `****@example.com`).
+   - **2-pass 분리 구조:** Coraza 응답 본문 필터와 `subs_filter` 가 한 server 에서 공존하면 `zero size buf` 오류로 응답이 끊기므로, **프론트 server(`:80`, `coraza on` → 요청측 WAF)** 와 **내부 server(`:8081`, `coraza off` → 마스킹 전담)** 를 분리해 충돌을 회피합니다. 이에 맞춰 `coraza.conf` 의 `SecResponseBodyAccess` 는 `Off` 로 둡니다(요청측 WAF 는 그대로 동작).
+   - **검증 하니스:** `tests/masking/` 의 **5×4 매트릭스**(`run_matrix.py` + `mock_backend.py`)로 4종 패턴 × 경계·청크 분할·gzip 등 케이스를 자동 검증합니다. 정규식의 알려진 한계(서울 `02-` 2자리 지역번호, 외국인등록번호 뒷자리, AMEX 카드, gzip 압축 응답)는 코드 주석과 매트릭스에 명시되어 있습니다.
 
 3. **Express 동적 보안 라우팅 프록시 (Aegis-3 Proxy)**
    - PostgreSQL 데이터베이스에 등재된 멀티테넌트(Tenant) 및 동적 라우팅 정책을 기반으로 라우팅 처리를 수행합니다.
@@ -126,13 +128,20 @@ Aegis-3/
 ├── .env                            # MongoDB/PostgreSQL/Gemini 마스터 자격증명
 ├── data/
 │   └── init.sql                    # PostgreSQL 테넌트 및 라우팅/허니팟 초기 데이터
+├── scripts/
+│   ├── setup-crs.sh                # OWASP CRS 룰셋 다운로드 스크립트 (최초 1회)
+│   └── aegis3_load_test.js         # k6 부하 테스트 (p95 지연·처리량 측정)
+├── tests/
+│   └── masking/                    # 개인정보 마스킹 5×4 검증 매트릭스
+│       ├── mock_backend.py         # 검증 전용 모의 백엔드 (:9100, 표준 라이브러리만 사용)
+│       └── run_matrix.py           # 전화/주민/카드/이메일 × 경계/청크/gzip 자동 검증
 ├── nginx/
-│   ├── Dockerfile                  # libcoraza & coraza-nginx 컴파일 + Node.js + 사이드카 빌드
+│   ├── Dockerfile                  # libcoraza & coraza-nginx + subs_filter 모듈 컴파일 + 사이드카 빌드
 │   ├── entrypoint.sh               # nginx + 사이드카 동시 기동, dynamic.conf 보장
 │   ├── sidecar.js                  # Express :4000, /api/v1/rules/inject, nginx -s reload
 │   ├── package.json                # 사이드카 Node 의존성 (express)
-│   ├── nginx.conf                  # Nginx 코어 설정 (Coraza 모듈 로드, 마스킹, 프록시)
-│   ├── coraza.conf                 # Coraza WAF 엔진 설정 (CRS + custom + dynamic.conf Include)
+│   ├── nginx.conf                  # Nginx 코어 설정 (Coraza+subs_filter 모듈, 2-pass 마스킹, 프록시)
+│   ├── coraza.conf                 # Coraza WAF 엔진 설정 (CRS + custom + dynamic.conf Include, 응답본문 Off)
 │   ├── crs-setup.conf              # OWASP CRS 메인 기동 구성 파일
 │   ├── crs/                        # OWASP CRS 보안 룰셋 디렉터리 (setup-crs.sh로 구성)
 │   └── rules/
@@ -238,7 +247,7 @@ Aegis-3/
 ```bash
 docker compose up -d --build
 ```
-모든 다중 서비스들(nginx + 사이드카, proxy, postgres, redis, mongodb, soar-api, soar-worker + Beat, detection-engine, analyzer, portal-backend)이 Docker 가상 컴퓨터 위에서 부팅되어 완벽한 고립 네트워크 상태로 작동됩니다.
+모든 다중 서비스들(nginx + 사이드카, proxy, postgres, redis, mongodb, soar-api, soar-worker + Beat, detection-engine, analyzer, portal-backend, 그리고 마스킹 검증용 mock-backend)이 Docker 가상 컴퓨터 위에서 부팅되어 완벽한 고립 네트워크 상태로 작동됩니다.
 
 > **첫 빌드 시간:** libcoraza + coraza-nginx 모듈 컴파일 때문에 5~10분이 걸릴 수 있습니다. 
 
@@ -259,6 +268,9 @@ docker exec aegis-redis redis-cli LPUSH aegis:security-events \
     "query":"id=1 UNION SELECT pw","headers":{"user-agent":"sqlmap"},"analysis_profile":"full"}'
 
 docker exec aegis-nginx cat /etc/nginx/rules/dynamic.conf   # AI 가 만든 SecRule 확인
+
+# 개인정보 마스킹 5×4 매트릭스 검증 (전화/주민/카드/이메일 × 경계/청크/gzip)
+python tests/masking/run_matrix.py                          # → PASS/FAIL 매트릭스 출력
 ```
 
 ---
