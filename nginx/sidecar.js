@@ -315,30 +315,45 @@ function startLogWatcher() {
   })
 
   let txn = null // 현재 누적 중인 트랜잭션
+  let captureIp = false // A 파트 IP가 다음 줄에 있는 포맷 대비
 
   tail.on('line', (line) => {
     const b = line.match(BOUNDARY_RE)
     if (b) {
       const part = b[1]
       if (part === 'A') {
-        txn = { ip: parseClientIpFromAHeader(line), ruleIds: new Set() }
+        // Coraza native 는 IP 헤더가 보통 '다음 줄'(--id-A-- 단독 줄)이지만,
+        // 일부 ModSecurity 호환 출력은 같은 줄에 둔다 → 둘 다 처리.
+        const ip = parseClientIpFromAHeader(line)
+        txn = { ip, ruleIds: new Set() }
+        captureIp = ip === null // 같은 줄에 없으면 다음 줄에서 캡처
       } else if (part === 'Z') {
         if (txn) finalizeTransaction(txn)
         txn = null
+        captureIp = false
+      } else {
+        captureIp = false // 다른 파트(B,H 등) 경계 → A 헤더 구간 종료
       }
+      return // 경계 라인 자체엔 룰 ID 없음
     }
 
-    if (txn) {
-      // 이 트랜잭션에서 매칭된 모든 룰 ID 누적 (주로 H 파트)
-      for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
-        txn.ruleIds.add(parseInt(m[1], 10))
-      }
-    } else {
+    if (!txn) {
       // 트랜잭션 경계 밖(파싱 실패 안전망): 라이브 룰 TTL 갱신만
       for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
         const id = parseInt(m[1], 10)
         if (liveRules.has(id)) liveRules.get(id).lastMatchedAt = Date.now()
       }
+      return
+    }
+
+    // A 경계 다음 줄에서 client IP 캡처
+    if (captureIp && !txn.ip) {
+      txn.ip = parseClientIpFromAHeader(line)
+      captureIp = false
+    }
+    // 이 트랜잭션에서 매칭된 모든 룰 ID 누적 (주로 H 파트)
+    for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
+      txn.ruleIds.add(parseInt(m[1], 10))
     }
   })
 
