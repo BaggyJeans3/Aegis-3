@@ -14,10 +14,10 @@
           ▼
 ┌──────────────────────────────────────────────────────┐
 │                  Nginx + Coraza WAF                  │ (Port 80, 2-pass)
-│  ├─ [Pass1 :80 ] coraza on  (ngx_http_coraza_module) │ (CRS + custom + AI dynamic 룰 차단)
+│  ├─ [Pass1 :80 ] coraza on  (ngx_http_coraza_module) │ (CRS + custom + AI 룰 차단 + Rate Limit)
 │  ├─ [Pass2 :8081] coraza off + subs_filter (regex)   │ (전화/주민/카드/이메일 마스킹 전담)
 │  ├─ /etc/nginx/rules/dynamic.conf                    │ (AI 가 적재한 SecRule 영속 저장)
-│  └─ Sidecar API :4000  /api/v1/rules/inject          │ (Worker → 룰 주입 + nginx -s reload)
+│  └─ Sidecar API :4000  rules/inject·promote·revoke   │ (Shadow→승격 / 하이브리드 TTL 만료)
 └──────────────────────────┬───────────────────────────┘
                            │ (proxy_pass)
                            ▼
@@ -81,6 +81,7 @@
 1. **지능형 WAF 방어 (Nginx + Coraza + OWASP CRS)**
    - Coraza WAF가 Nginx 동적 모듈로 삽입되어 SQL Injection, XSS, Path Traversal 등의 위협을 실시간 탐지하고 차단합니다.
    - 공식 **OWASP CRS (Core Rule Set)** 및 Aegis-3 전용 커스텀 정책 룰셋을 원격 통합 관리합니다.
+   - **Rate Limit (L7 1차 방어):** 프론트 server(`:80`)에서 단일 IP 기준 분당 요청을 제한합니다(`limit_req_zone`, 기본 `60r/m` + `burst=20`, 초과 시 `429`). 검증 경로 `/__masking_test__/` 는 제외하며, `rate`/`burst` 값은 운영 트래픽에 맞게 조정합니다.
 
 2. **개인정보 자동 마스킹 (Nginx subs_filter 정규식 + 2-pass 구조)**
    - 백엔드 응답 본문에 노출된 **전화번호·주민등록번호·카드번호·이메일**을 `ngx_http_substitutions_filter_module` 의 **PCRE 정규식**으로 가로채, 형식은 유지하고 값만 가리는 형태로 실시간 치환합니다 (예: `010-1234-5678` → `010-****-****`, `900101-1234567` → `900101-1******`, `1234-5678-9012-3456` → `****-****-****-3456`, `user@example.com` → `****@example.com`).
@@ -107,6 +108,9 @@
    - 생성된 룰은 **Nginx 컨테이너 내부 Node.js 사이드카(:4000)** 의 `/api/v1/rules/inject` 로 전송되어 `/etc/nginx/rules/dynamic.conf` 에 append 되고 `nginx -s reload` 가 자동 실행되어 **즉시 차단** 에 반영됩니다.
    - AI 룰 ID 는 OWASP CRS (9xxxxxx) 와 격리된 **2,000,000,000~2,099,999,999** 범위를 ms 정밀도로 채워 자체 충돌도 회피합니다.
    - `dynamic.conf` 는 named volume(`nginx_dynamic_rules`)으로 마운트되어 컨테이너 재시작에도 학습된 룰이 보존됩니다.
+   - **Shadow Mode (오탐 방지 + 공격 식별):** 주입된 룰은 즉시 `deny` 가 아니라 `pass,log` 로 먼저 들어가 `SHADOW_DURATION`(기본 5분) 동안 관찰됩니다. 사이드카가 Coraza audit log 를 **트랜잭션 단위로 파싱**해, 매칭된 요청을 **C(같은 트랜잭션에서 OWASP CRS 룰도 동시 매칭) 또는 B(요청 IP가 `aegis:blacklist`)** 면 '공격', 둘 다 아니면 '오탐 의심'으로 분류합니다. 만료 시 **오탐 의심 0건 → `deny` 승격(promote) / 1건이라도 있으면 폐기(revoke)** → **정상 트래픽 차단 0건을 지키면서 실제 공격 룰만 승격**합니다. (B 의 블랙리스트 조회는 사이드카의 Redis 연결을 쓰며, 실패 시 C 만으로 fail-open)
+   - **하이브리드 TTL (자동 만료):** 승격된 룰은 ① **idle 만료**(무매칭 `TTL_SECONDS`, 기본 24h) 또는 ② **절대 상한**(주입 후 `MAX_RULE_AGE_SECONDS`, 기본 7일) 중 먼저 도달하는 시점에 자동 제거되고 `nginx -s reload` 됩니다. 활성 공격은 계속 차단하되(가용성), 갇힌 오탐·낡은 룰은 상한으로 강제 만료(자정작용)됩니다. 청소 주기는 `CLEANUP_INTERVAL`(기본 60초).
+   - **룰 수명 관리 API:** 사이드카가 `POST /api/v1/rules/promote/:id`(승격), `POST /api/v1/rules/revoke/:id`(제거), `GET /api/v1/rules`(상태·만료시각 조회)를 제공하여 슬랙 ChatOps 명령(기능 7)으로 직접 제어할 수 있습니다.
 
 7. **실시간 관제 및 긴급 오케스트레이션 (Analyzer)**
    - **Cloudflare WAF 연동:** 공격 IP에 대한 Cloudflare 방화벽 차단 API를 호출하여 해당 IP를 네트워크 엣지 단에서 영구 격리합니다.
@@ -115,7 +119,7 @@
      | 명령어 | 동작 |
      |---|---|
      | `차단해제 <IP>` | 해당 IP의 Cloudflare 차단 룰을 찾아 해제 (IPv4 형식 검증 후 삭제된 rule id 회신) |
-     | `룰목록` | 사이드카 `GET /api/v1/rules` 로 현재 `dynamic.conf` 에 주입된 AI 룰 ID·본문을 조회 (최대 20개 표시) |
+     | `룰목록` | 사이드카 `GET /api/v1/rules` 로 주입된 AI 룰의 ID·본문과 **상태(shadow/live)·만료 예정시각(KST)** 을 조회 (최대 20개 표시) |
      | `룰비활성 <id>` | 사이드카 `POST /api/v1/rules/revoke/:id` 로 지정 룰을 제거 (Shadow/Live 메모리 상태까지 정리) |
      | `보고` | 현재까지의 탐지 내역을 종합한 HTML 이메일 보고서를 수동 발송 |
    - **Email 연동:** SMTP 프로토콜을 통하여 관제 담당자의 편지함에 직관적이고 미려한 HTML 위협 분석 보고서를 발송합니다.
@@ -225,6 +229,22 @@ Aegis-3/
   BEAT_CONSUME_INTERVAL=2.0
   ```
   > **Note:** MongoDB 패스워드에 `@ : / ? #` 같은 RFC 3986 reserved 문자가 들어가도 워커가 자동으로 URL-encode 합니다 (`MONGO_USER`, `MONGO_HOST`, `MONGO_PORT`, `MONGO_AUTH_SOURCE` 별도 env 로 받아 안전하게 URI 조립).
+
+* **사이드카 룰 수명 관리 (선택 — `docker-compose.yml` 의 `nginx` 서비스 `environment`):**
+  ```env
+  # Shadow Mode 관찰 시간(초). 이 시간 동안 오탐 0건이면 deny 승격, 1건 이상이면 폐기. 기본 300(5분)
+  SHADOW_DURATION=300
+
+  # 하이브리드 TTL ①: 승격된 룰이 이 시간 동안 무매칭이면 제거(idle 만료). 기본 86400(24h)
+  TTL_SECONDS=86400
+
+  # 하이브리드 TTL ②: 매칭이 계속돼도 주입 후 이 시간이 지나면 강제 만료(절대 상한). 기본 604800(7일)
+  MAX_RULE_AGE_SECONDS=604800
+
+  # 만료 룰 청소 주기(초). 기본 60(1분)
+  CLEANUP_INTERVAL=60
+  ```
+  > **Note:** 데모 시연 시에는 `SHADOW_DURATION=30`, `TTL_SECONDS=60` 처럼 짧게 두면 승격·만료 동작을 빠르게 관찰할 수 있습니다. 이 값들은 `.env` 가 아니라 compose 의 nginx 서비스 환경변수로 주입됩니다.
 
 * **대응 엔진 자격증명 설정 (`./services/ingestion/analyzer/.env`):**
   ```env

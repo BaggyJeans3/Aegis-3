@@ -3,7 +3,7 @@ import json
 import time
 import requests
 from datetime import datetime
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote, unquote_plus
 from pymongo import MongoClient
 
 from celery_app import celery_app, redis_client
@@ -52,26 +52,64 @@ NGINX_SIDECAR_URL = os.getenv(
 # ============================================================
 
 CLUSTER_TTL_SECONDS = int(os.getenv("CLUSTER_TTL_SECONDS", "300"))  # 5분
+FP_THRESHOLD = int(os.getenv("FP_THRESHOLD", "3"))  # 오탐지 의심 임계값
+
+
+def _sort_query_params(query: str) -> str:
+    """
+    쿼리 파라미터를 키 기준으로 정렬해 순서 무관 정규화한다.
+    a=1&b=2 와 b=2&a=1 을 동일 키로 묶기 위함(의미 보존).
+    """
+    if not query:
+        return ""
+    parts = [p for p in query.split("&") if p]
+    parts.sort()
+    return "&".join(parts)
 
 
 def normalize_attack_log(raw_event: dict) -> str:
     """
     공격 로그에서 IP·세션·타임스탬프 등 변동 요소를 제거하고
     공격 패턴의 본질만 남긴 정규화 문자열을 반환한다.
+
+    '표현만 다른 동일 공격'을 같은 키로 모으기 위해 의미 보존 정규화를 수행한다
+    (URL 디코딩 → 파라미터 키 정렬 → 토큰/숫자 치환). 단, 서로 다른 내용을 같게
+    만드는 변형(키워드 토큰화 등)은 false-merge 위험이 있어 하지 않는다.
     """
     method = (raw_event.get("method") or "").upper()
     path = (raw_event.get("path") or "").lower()
-    query = (raw_event.get("query") or "").lower()
-    body = (raw_event.get("body") or "").lower()
+    query = raw_event.get("query") or ""
+    body = raw_event.get("body") or ""
     ua = (raw_event.get("headers", {}).get("user-agent") or "").lower()
+
+    # 1. URL 디코딩 — %27 vs ' 처럼 인코딩만 다른 페이로드를 동일화.
+    #    query 는 form 의미상 '+'→공백(unquote_plus), body(JSON 등)는 '+' 보존(unquote).
+    try:
+        query = unquote_plus(query)
+    except Exception:
+        pass
+    try:
+        body = unquote(body)
+    except Exception:
+        pass
+    query = query.lower()
+    body = body.lower()
+
+    # 2. 쿼리 파라미터 키 정렬 (파라미터 순서만 다른 동일 공격 통일)
+    query = _sort_query_params(query)
 
     text = f"{method} {path}?{query} body={body} ua={ua}"
 
-    # 숫자 → N  (id=123, id=999 같은 변동값 통일)
+    # 3. 토큰/UUID 먼저 치환 (숫자 치환보다 앞서야 hex 런이 깨지지 않음)
+    text = re.sub(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        "X",
+        text,
+    )  # UUID
+    text = re.sub(r"[a-f0-9]{16,}", "X", text)  # 긴 hex(세션 토큰/해시)
+    # 4. 숫자 → N (id=123, id=999 같은 변동값 통일)
     text = re.sub(r"\d+", "N", text)
-    # 긴 16진수/UUID → X  (세션 토큰, 해시값 통일)
-    text = re.sub(r"[a-f0-9]{16,}", "X", text)
-    # 연속 공백 정리
+    # 5. 연속 공백 정리
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
@@ -82,6 +120,60 @@ def compute_cluster_key(raw_event: dict) -> str:
     normalized = normalize_attack_log(raw_event)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
     return f"aegis:cluster:{digest}"
+
+
+# ============================================================
+# [Aegis-3 SOAR] 오탐지 감지 — 운영자 unblock 추적
+# blacklist에 등록됐던 IP가 운영자에 의해 해제되면 오탐지 의심 카운터를 증가시키고,
+# 임계값을 넘으면 의심 IP Set에 추가하여 운영자가 조회할 수 있게 한다.
+# ============================================================
+
+
+def record_false_positive(ip: str) -> dict:
+    """
+    운영자가 blacklist IP를 해제할 때 호출되는 함수.
+    Slack 봇의 unblock 명령에서 이 함수를 부르도록 협의 필요.
+    """
+    if not ip or ip == "unknown":
+        return {"ok": False, "reason": "invalid_ip"}
+
+    try:
+        # 해당 IP의 오탐지 의심 카운터 증가
+        fp_count = redis_client.incr(f"aegis:false_positive:{ip}")
+        # 전체 통계
+        redis_client.incr("aegis:stats:false_positive_total")
+        # TTL 30일 — 그 이후엔 카운터 자동 만료
+        redis_client.expire(f"aegis:false_positive:{ip}", 60 * 60 * 24 * 30)
+
+        # 임계값 초과 시 의심 IP Set에 추가
+        is_suspect = False
+        if fp_count >= FP_THRESHOLD:
+            redis_client.sadd("aegis:suspect_fp_ips", ip)
+            is_suspect = True
+            print(f"[Worker] ⚠️ 오탐지 의심 IP 등록: {ip} (해제 횟수: {fp_count}, 임계값: {FP_THRESHOLD})")
+        else:
+            print(f"[Worker] 📝 unblock 기록: {ip} (해제 횟수: {fp_count}/{FP_THRESHOLD})")
+
+        return {
+            "ok": True,
+            "ip": ip,
+            "fp_count": fp_count,
+            "threshold": FP_THRESHOLD,
+            "is_suspect": is_suspect,
+        }
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 오탐지 기록 실패: {redis_err}")
+        return {"ok": False, "reason": str(redis_err)}
+
+
+def get_suspect_fp_ips() -> list:
+    """오탐지 의심 IP 목록 조회. Slack 봇 또는 운영자가 호출."""
+    try:
+        ips = redis_client.smembers("aegis:suspect_fp_ips")
+        return list(ips) if ips else []
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 의심 IP 조회 실패: {redis_err}")
+        return []
 
 
 def normalize_redis_log(log_data):

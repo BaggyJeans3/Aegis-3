@@ -3,19 +3,54 @@ const fs = require('fs')
 const { exec } = require('child_process')
 const path = require('path')
 const Tail = require('tail').Tail
+const redis = require('redis')
 
 const app = express()
 const port = parseInt(process.env.SIDECAR_PORT || '4000', 10)
 const SHADOW_DURATION = parseInt(process.env.SHADOW_DURATION || '300', 10)
-const TTL_SECONDS = parseInt(process.env.TTL_SECONDS || '86400', 10)
+const TTL_SECONDS = parseInt(process.env.TTL_SECONDS || '86400', 10) // idle 만료(무매칭 시)
+// 하이브리드 TTL 절대 상한: 매칭이 계속돼도 이 시간이 지나면 강제 만료·재평가.
+// idle(TTL_SECONDS)보다 충분히 커야 sliding 효과가 의미 있음. 기본 7일.
+const MAX_RULE_AGE_SECONDS = parseInt(
+  process.env.MAX_RULE_AGE_SECONDS || '604800',
+  10,
+)
 const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL || '60', 10)
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || '/var/log/coraza/audit.log'
 const rulePath = process.env.RULE_FILE || '/etc/nginx/rules/dynamic.conf'
 const nginxBin = process.env.NGINX_BIN || '/usr/sbin/nginx'
 
+// AI 동적 룰 ID 대역 (README 기준). 이 밖의 매칭 룰(CRS 9xxxxx·정적 커스텀)은
+// 사람이 검증한 룰이라 Shadow 판정의 교차검증(C) 신호로 신뢰한다.
+const AI_RULE_ID_MIN = 2000000000
+const AI_RULE_ID_MAX = 2099999999
+
+// Shadow 판정 B(IP 평판)용 Redis. 연결 실패해도 핵심기능은 계속(fail-open: B 생략=C만).
+const REDIS_HOST = process.env.REDIS_HOST || 'redis'
+const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10)
+let redisReady = false
+const redisClient = redis.createClient({
+  socket: { host: REDIS_HOST, port: REDIS_PORT },
+})
+redisClient.on('ready', () => {
+  redisReady = true
+  console.log(
+    `[Sidecar] Redis 연결됨 (${REDIS_HOST}:${REDIS_PORT}) — Shadow B(IP 평판) 활성`,
+  )
+})
+redisClient.on('error', () => {
+  redisReady = false
+})
+redisClient.connect().catch((err) => {
+  console.warn(
+    `[Sidecar] Redis 연결 실패: ${err.message} — Shadow 판정은 C(CRS 교차검증)만 사용`,
+  )
+})
+
 // Shadow Mode 중인 룰들
-const shadowRules = new Map() // rule_id → { startedAt, ruleText }
-const shadowCounters = new Map() // rule_id → matched count
+const shadowRules = new Map() // rule_id → { startedAt, ruleText, expiresAt }
+// shadow 매칭 분류 통계: total=총매칭, attack=공격 확정, fp=오탐 의심
+const shadowStats = new Map() // rule_id → { total, attack, fp }
 
 // 승격된 라이브 룰들
 const liveRules = new Map() // rule_id → { promotedAt, lastMatchedAt }
@@ -75,7 +110,7 @@ app.post('/api/v1/rules/inject', (req, res) => {
     ruleText: shadowRule,
     expiresAt: Date.now() + TTL_SECONDS * 1000, // 참고용 메타데이터
   })
-  shadowCounters.set(ruleId, 0)
+  shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
   console.log(`[Shadow] injected ${ruleId} (will judge in ${SHADOW_DURATION}s)`)
 
   // 5. nginx reload
@@ -138,6 +173,7 @@ app.get('/api/v1/rules', (_req, res) => {
 
   const lines = content.split('\n')
   const rules = []
+  const now = Date.now()
 
   lines.forEach((line, index) => {
     const trimmed = line.trim()
@@ -146,19 +182,129 @@ app.get('/api/v1/rules', (_req, res) => {
     const match = trimmed.match(/id:(\d+)/)
     if (!match) return
 
+    // dynamic.conf 엔 룰 텍스트만 있고 만료시각이 없으므로 메모리(shadow/live)와 교차 조회
+    const meta = describeRuleLifecycle(parseInt(match[1], 10), now)
+
     rules.push({
       id: match[1],
       line_number: index + 1,
       rule: trimmed,
+      status: meta.status, // 'shadow' | 'live' | 'unknown'
+      expires_at: meta.expires_at, // live 룰의 실제 만료 예정(ISO) 또는 null
+      shadow_until: meta.shadow_until, // shadow 룰의 판정 예정 시각(ISO) 또는 null
     })
   })
 
   return res.json({ rules, total: rules.length })
 })
 
+// 메모리(shadowRules/liveRules)에서 룰 수명 메타데이터를 조회한다.
+// 사이드카 재시작 시 메모리 상태는 사라지므로(파일 룰은 유지) status='unknown' 이 될 수 있다.
+function describeRuleLifecycle(ruleId, now) {
+  if (shadowRules.has(ruleId)) {
+    const info = shadowRules.get(ruleId)
+    return {
+      status: 'shadow',
+      shadow_until: new Date(
+        info.startedAt + SHADOW_DURATION * 1000,
+      ).toISOString(),
+      expires_at: null,
+    }
+  }
+  if (liveRules.has(ruleId)) {
+    const info = liveRules.get(ruleId)
+    const idleExpiry = info.lastMatchedAt + TTL_SECONDS * 1000
+    // 하이브리드: idle 만료와 절대 상한 중 먼저 오는 시각이 실제 만료 예정
+    const effective = Math.min(idleExpiry, info.expiresAt)
+    return {
+      status: 'live',
+      expires_at: new Date(effective).toISOString(),
+      shadow_until: null,
+    }
+  }
+  return { status: 'unknown', expires_at: null, shadow_until: null }
+}
+
 // ============================================================
-// audit log 워치 — 룰 매칭 이벤트 수집
+// audit log 워치 — Coraza serial(native) 포맷을 '트랜잭션 단위'로 파싱
+//
+// native 1건: --<id>-A-- (헤더, client IP 포함) ~ --<id>-Z-- (종료) 사이.
+// 한 트랜잭션의 매칭 룰 ID 전체 + client IP 를 모아, shadow 룰 매칭을
+// C(CRS 교차검증) + B(IP 평판) 하이브리드로 '공격 vs 오탐'으로 분류한다.
 // ============================================================
+const BOUNDARY_RE = /^--\S+-([A-Z])--/ // --<boundaryId>-A-- 형태
+
+function isAiRuleId(id) {
+  return id >= AI_RULE_ID_MIN && id <= AI_RULE_ID_MAX
+}
+// CRS(9xxxxx)·Aegis 정적 커스텀 등 사람이 검증한 룰 → 교차검증 신뢰 신호
+function isCorroboratingRule(id) {
+  return !isAiRuleId(id)
+}
+
+// part A 경계 라인에서 client IP 추출:
+//   --<id>-A-- [ts] <uniqueId> <clientIP> <clientPort> <serverIP> <serverPort>
+function parseClientIpFromAHeader(line) {
+  const afterTs = line.includes(']') ? line.slice(line.indexOf(']') + 1) : line
+  const tokens = afterTs.trim().split(/\s+/)
+  const ip = tokens[1] // [uniqueId, clientIP, ...]
+  if (ip && /^\d{1,3}(\.\d{1,3}){3}$/.test(ip)) return ip
+  const m = afterTs.match(/\b(\d{1,3}(?:\.\d{1,3}){3})\b/)
+  return m ? m[1] : null
+}
+
+async function isIpBlacklisted(ip) {
+  if (!ip || !redisReady) return false // fail-open: Redis 없으면 B 생략(=C만)
+  try {
+    return (await redisClient.exists(`aegis:blacklist:${ip}`)) === 1
+  } catch (err) {
+    console.warn(`[Shadow] blacklist 조회 실패(${ip}): ${err.message}`)
+    return false
+  }
+}
+
+// shadow 룰 매칭 1건을 공격/오탐으로 분류해 통계 누적
+async function classifyShadowMatch(ruleId, crsCorroborated, ip) {
+  const stats = shadowStats.get(ruleId)
+  if (!stats) return
+  stats.total += 1
+
+  // C(CRS 동시매칭) 또는 B(공격자 IP) 중 하나면 '공격 확정'
+  const ipBad = crsCorroborated ? false : await isIpBlacklisted(ip)
+  if (crsCorroborated || ipBad) {
+    stats.attack += 1
+    console.log(
+      `[Shadow] ${ruleId} 공격 매칭 (CRS=${crsCorroborated}, ipBlacklist=${ipBad}, ip=${ip}) attack=${stats.attack}`,
+    )
+  } else {
+    stats.fp += 1
+    console.log(
+      `[Shadow] ${ruleId} 오탐 의심 매칭 (CRS無 + 정상 IP=${ip}) fp=${stats.fp}`,
+    )
+  }
+}
+
+// 트랜잭션 종료 시: 라이브 룰 TTL 갱신 + shadow 룰 분류
+function finalizeTransaction(txn) {
+  const ids = [...txn.ruleIds]
+  if (ids.length === 0) return
+
+  const now = Date.now()
+  for (const id of ids) {
+    if (liveRules.has(id)) {
+      liveRules.get(id).lastMatchedAt = now
+      console.log(`[TTL] refreshed ${id}`)
+    }
+  }
+
+  const crsCorroborated = ids.some(isCorroboratingRule)
+  for (const id of ids) {
+    if (shadowRules.has(id)) {
+      classifyShadowMatch(id, crsCorroborated, txn.ip)
+    }
+  }
+}
+
 function startLogWatcher() {
   console.log(`[LogWatch] starting tail on ${AUDIT_LOG_PATH}`)
 
@@ -168,26 +314,30 @@ function startLogWatcher() {
     useWatchFile: true, // Docker 볼륨 호환성 위해
   })
 
+  let txn = null // 현재 누적 중인 트랜잭션
+
   tail.on('line', (line) => {
-    // 한 줄에서 모든 룰 ID 추출
-    const matches = [...line.matchAll(/\[id "(\d+)"\]/g)]
-    if (matches.length === 0) return
-
-    for (const m of matches) {
-      const ruleId = parseInt(m[1], 10)
-
-      // Shadow 중인 룰이면 카운트
-      if (shadowRules.has(ruleId)) {
-        const prev = shadowCounters.get(ruleId) || 0
-        shadowCounters.set(ruleId, prev + 1)
-        console.log(`[Shadow] matched ${ruleId}, count=${prev + 1}`)
+    const b = line.match(BOUNDARY_RE)
+    if (b) {
+      const part = b[1]
+      if (part === 'A') {
+        txn = { ip: parseClientIpFromAHeader(line), ruleIds: new Set() }
+      } else if (part === 'Z') {
+        if (txn) finalizeTransaction(txn)
+        txn = null
       }
+    }
 
-      // 라이브 룰이면 last_matched_at 갱신
-      if (liveRules.has(ruleId)) {
-        const rule = liveRules.get(ruleId)
-        rule.lastMatchedAt = Date.now()
-        console.log(`[TTL] refreshed ${ruleId}`)
+    if (txn) {
+      // 이 트랜잭션에서 매칭된 모든 룰 ID 누적 (주로 H 파트)
+      for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
+        txn.ruleIds.add(parseInt(m[1], 10))
+      }
+    } else {
+      // 트랜잭션 경계 밖(파싱 실패 안전망): 라이브 룰 TTL 갱신만
+      for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
+        const id = parseInt(m[1], 10)
+        if (liveRules.has(id)) liveRules.get(id).lastMatchedAt = Date.now()
       }
     }
   })
@@ -200,7 +350,7 @@ function startLogWatcher() {
 startLogWatcher()
 console.log(`[Scheduler] shadow expiration check every 10s`)
 console.log(
-  `[Scheduler] TTL cleanup every ${CLEANUP_INTERVAL}s, TTL=${TTL_SECONDS}s`,
+  `[Scheduler] TTL cleanup every ${CLEANUP_INTERVAL}s, idle TTL=${TTL_SECONDS}s, max age=${MAX_RULE_AGE_SECONDS}s`,
 )
 
 // ============================================================
@@ -217,16 +367,26 @@ function checkShadowExpirations() {
   }
 
   for (const ruleId of expired) {
-    const count = shadowCounters.get(ruleId) || 0
-    if (count === 0) {
-      console.log(`[Shadow] promoting ${ruleId} (FP=0)`)
+    const stats = shadowStats.get(ruleId) || { total: 0, attack: 0, fp: 0 }
+    if (stats.fp > 0) {
+      // 정상 트래픽이 한 건이라도 매칭 → 차단 시 오탐 위험 → 폐기 (정상 0건 차단 보장)
+      console.log(
+        `[Shadow] revoking ${ruleId} (오탐 의심 ${stats.fp}건, 공격 ${stats.attack}건) — 정상 트래픽 보호`,
+      )
+      revokeRule(ruleId)
+    } else if (stats.attack > 0) {
+      // 공격만 매칭, 오탐 0 → 승격
+      console.log(
+        `[Shadow] promoting ${ruleId} (공격 ${stats.attack}건, 오탐 0)`,
+      )
       promoteRule(ruleId)
     } else {
-      console.log(`[Shadow] revoking ${ruleId} (FP=${count})`)
-      revokeRule(ruleId)
+      // 매칭 자체가 없음 → 승격 (FP=0)
+      console.log(`[Shadow] promoting ${ruleId} (매칭 없음, FP=0)`)
+      promoteRule(ruleId)
     }
     shadowRules.delete(ruleId)
-    shadowCounters.delete(ruleId)
+    shadowStats.delete(ruleId)
   }
 }
 
@@ -242,16 +402,23 @@ function checkTTLExpirations() {
   const toRevoke = []
 
   for (const [ruleId, info] of liveRules) {
-    if (now - info.lastMatchedAt >= ttlMs) {
-      toRevoke.push(ruleId)
+    // 하이브리드: ① idle 만료(무매칭 24h) 또는 ② 절대 상한(주입 후 7일) 둘 중 하나라도 충족
+    const idleExpired = now - info.lastMatchedAt >= ttlMs
+    const maxAgeExpired = now >= info.expiresAt
+    if (idleExpired || maxAgeExpired) {
+      toRevoke.push({ ruleId, reason: maxAgeExpired ? 'max_age' : 'idle' })
     }
   }
 
-  for (const ruleId of toRevoke) {
-    const idleSec = Math.floor(
-      (now - liveRules.get(ruleId).lastMatchedAt) / 1000,
-    )
-    console.log(`[TTL] removing ${ruleId} (no match for ${idleSec}s)`)
+  for (const { ruleId, reason } of toRevoke) {
+    const info = liveRules.get(ruleId)
+    if (reason === 'max_age') {
+      const ageSec = Math.floor((now - info.promotedAt) / 1000)
+      console.log(`[TTL] removing ${ruleId} (max age reached, alive ${ageSec}s)`)
+    } else {
+      const idleSec = Math.floor((now - info.lastMatchedAt) / 1000)
+      console.log(`[TTL] removing ${ruleId} (no match for ${idleSec}s)`)
+    }
     revokeRule(ruleId) // revokeRule이 liveRules.delete까지 다 처리함
   }
 }
@@ -287,7 +454,8 @@ function promoteRule(ruleId) {
     liveRules.set(ruleId, {
       promotedAt: now,
       lastMatchedAt: now,
-      expiresAt: now + TTL_SECONDS * 1000,
+      // 절대 만료 상한(하이브리드). idle 만료와 별개로, 이 시각이 지나면 강제 제거.
+      expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
     })
 
     // nginx reload
@@ -315,7 +483,7 @@ function revokeRule(ruleId) {
         `[Revoke] rule ${ruleId} not found in ${rulePath}, cleaning memory anyway`,
       )
       shadowRules.delete(ruleId)
-      shadowCounters.delete(ruleId)
+      shadowStats.delete(ruleId)
       liveRules.delete(ruleId)
       return false
     }
@@ -324,7 +492,7 @@ function revokeRule(ruleId) {
 
     // 모든 상태에서 제거
     shadowRules.delete(ruleId)
-    shadowCounters.delete(ruleId)
+    shadowStats.delete(ruleId)
     liveRules.delete(ruleId)
 
     exec(`${nginxBin} -s reload`, (err) => {

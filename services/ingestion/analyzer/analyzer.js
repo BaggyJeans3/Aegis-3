@@ -204,10 +204,19 @@ slackApp.message(/^차단해제\s+(\S+)/, async ({ context, say, message }) => {
   }
 })
 
+// ISO(UTC) 시각 문자열을 KST 표기로 변환 (ICU 의존 없이 +9h 후 포맷).
+function fmtKst(iso) {
+  if (!iso) return '-'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  const kst = new Date(d.getTime() + 9 * 60 * 60 * 1000)
+  return kst.toISOString().replace('T', ' ').slice(0, 19) + ' KST'
+}
+
 // 명령어 2: 룰목록
 // 예시: "룰목록"
-// 사이드카의 GET /api/v1/rules 호출 -> 현재 dynamic.conf 에 있는 룰의 ID 와 본문 반환
-// (Shadow/Live 상태 구분은 안 함 - 단순한 형태)
+// 사이드카의 GET /api/v1/rules 호출 -> 현재 dynamic.conf 룰의 ID·본문 + 상태/만료시각 반환
+// 상태: shadow(판정 대기) / live(차단 활성, 만료 예정시각 표시) / unknown(재시작 등으로 메모리 소실)
 slackApp.message(/^룰목록\s*$/, async ({ say, message }) => {
   await say(
     `🔍 <@${message.user}>님 요청으로 현재 주입된 AI 룰 목록 조회 중...`,
@@ -231,7 +240,16 @@ slackApp.message(/^룰목록\s*$/, async ({ say, message }) => {
       .map((r) => {
         const snippet =
           r.rule.length > 100 ? r.rule.slice(0, 97) + '...' : r.rule
-        return `• *id:${r.id}*\n   \`${snippet}\``
+        // 상태/만료시각 메타 (사이드카가 메모리에서 교차 조회해 내려줌)
+        let meta
+        if (r.status === 'shadow') {
+          meta = `🕶️ shadow (판정 예정: ${fmtKst(r.shadow_until)})`
+        } else if (r.status === 'live') {
+          meta = `🛡️ live (만료 예정: ${fmtKst(r.expires_at)})`
+        } else {
+          meta = `❔ unknown (재시작 등으로 수명정보 없음)`
+        }
+        return `• *id:${r.id}* — ${meta}\n   \`${snippet}\``
       })
       .join('\n')
 
