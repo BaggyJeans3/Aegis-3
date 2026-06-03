@@ -9,6 +9,36 @@ const app = express();
 
 app.use(express.json());
 
+// ──────────────────────────────────────────────────────────
+// [Aegis-3 SOAR] IP 평판 1차 차단
+// 24시간 내 악성 판정된 IP는 라우팅·로깅·LLM 어느 단계도 거치지 않고
+// 즉시 403으로 차단한다. 같은 공격자의 반복 요청 비용을 최소화한다.
+// Redis 장애 시 fail-open — 차단 못 하더라도 정상 요청은 통과시킨다.
+// 모든 라우트보다 먼저 실행되도록 express.json() 바로 다음에 배치한다.
+// ──────────────────────────────────────────────────────────
+app.use(async (req, res, next) => {
+  const clientIp = getClientIp(req);
+
+  if (clientIp && clientIp !== 'unknown') {
+    try {
+      const isBlocked = await redisClient.exists(`aegis:blacklist:${clientIp}`);
+      if (isBlocked) {
+        console.log(`[BLOCKED] ${req.method} ${req.headers.host}${req.path} from ${clientIp} — IP blacklist hit`);
+        // 통계 카운터 (대시보드용, 실패해도 차단 동작은 계속)
+        redisClient.incr('aegis:stats:proxy_blocked').catch(() => {});
+        return res.status(403).json({
+          status: 'forbidden',
+          message: 'Access denied',
+        });
+      }
+    } catch (err) {
+      console.warn(`[Aegis-3] Redis 블랙리스트 조회 실패(ip=${clientIp}): ${err.message} — fail-open으로 요청 통과`);
+    }
+  }
+
+  return next();
+});
+
 // 1. 루트 경로 (/) 정의: 404 방지 및 시스템 상태 확인용
 app.get('/', (req, res) => {
   res.json({
