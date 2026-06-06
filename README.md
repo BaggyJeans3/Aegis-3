@@ -108,9 +108,11 @@
    - 생성된 룰은 **Nginx 컨테이너 내부 Node.js 사이드카(:4000)** 의 `/api/v1/rules/inject` 로 전송되어 `/etc/nginx/rules/dynamic.conf` 에 append 되고 `nginx -s reload` 가 자동 실행되어 **즉시 차단** 에 반영됩니다.
    - AI 룰 ID 는 OWASP CRS (9xxxxxx) 와 격리된 **2,000,000,000~2,099,999,999** 범위를 ms 정밀도로 채워 자체 충돌도 회피합니다.
    - `dynamic.conf` 는 named volume(`nginx_dynamic_rules`)으로 마운트되어 컨테이너 재시작에도 학습된 룰이 보존됩니다.
-   - **Shadow Mode (오탐 방지 + 공격 식별):** 주입된 룰은 즉시 `deny` 가 아니라 `pass,log` 로 먼저 들어가 `SHADOW_DURATION`(기본 5분) 동안 관찰됩니다. 사이드카가 Coraza audit log 를 **트랜잭션 단위로 파싱**해, 매칭된 요청을 **C(같은 트랜잭션에서 OWASP CRS 룰도 동시 매칭) 또는 B(요청 IP가 `aegis:blacklist`)** 면 '공격', 둘 다 아니면 '오탐 의심'으로 분류합니다. 만료 시 **오탐 의심 0건 → `deny` 승격(promote) / 1건이라도 있으면 폐기(revoke)** → **정상 트래픽 차단 0건을 지키면서 실제 공격 룰만 승격**합니다. (B 의 블랙리스트 조회는 사이드카의 Redis 연결을 쓰며, 실패 시 C 만으로 fail-open)
-   - **하이브리드 TTL (자동 만료):** 승격된 룰은 ① **idle 만료**(무매칭 `TTL_SECONDS`, 기본 24h) 또는 ② **절대 상한**(주입 후 `MAX_RULE_AGE_SECONDS`, 기본 7일) 중 먼저 도달하는 시점에 자동 제거되고 `nginx -s reload` 됩니다. 활성 공격은 계속 차단하되(가용성), 갇힌 오탐·낡은 룰은 상한으로 강제 만료(자정작용)됩니다. 청소 주기는 `CLEANUP_INTERVAL`(기본 60초).
-   - **룰 수명 관리 API:** 사이드카가 `POST /api/v1/rules/promote/:id`(승격), `POST /api/v1/rules/revoke/:id`(제거), `GET /api/v1/rules`(상태·만료시각 조회)를 제공하여 슬랙 ChatOps 명령(기능 7)으로 직접 제어할 수 있습니다.
+   - **Shadow Mode (오탐 방지 + 공격 식별):** 주입된 룰은 즉시 `deny` 가 아니라 `pass,log` 로 먼저 들어가 `SHADOW_DURATION`(기본 5분) 동안 관찰됩니다. 사이드카가 Coraza audit log 를 **트랜잭션 단위로 파싱**해, 매칭된 요청을 **C(같은 트랜잭션에서 OWASP CRS 룰도 동시 매칭) 또는 B(요청 IP가 `aegis:blacklist`)** 면 '공격', 둘 다 아니면 '오탐 의심'으로 분류합니다. 만료 시 판정: **오탐 의심 1건이라도 있으면 보관(archive)**, **'공격' 표본이 `MIN_SHADOW_SAMPLES`(기본 1)건 이상이면 `deny` 승격(promote)**. 둘 다 아닌 **표본 부족(무매칭 등)** 은 검증 근거가 없어 승격하지 않고 `SHADOW_MAX_DURATION`(기본 1h)까지 관찰을 연장하며, 그래도 모자라면 보관합니다. → **정상 트래픽 차단 0건을 지키면서 '검증된' 공격 룰만 승격**(검증 안 된 룰을 자동으로 deny 시키지 않음). (B 의 블랙리스트 조회는 사이드카의 Redis 연결을 쓰며, 실패 시 C 만으로 fail-open)
+   - **하이브리드 TTL (자동 만료):** 승격된 룰은 ① **idle 만료**(무매칭 `TTL_SECONDS`, 기본 24h) 또는 ② **절대 상한**(주입 후 `MAX_RULE_AGE_SECONDS`, 기본 7일) 중 먼저 도달하는 시점에 **활성 룰 파일에서 내려 보관(archive)** 되고 `nginx -s reload` 됩니다(물리 삭제 아님 — 아래 *보관·재무장* 참고). 활성 공격은 계속 차단하되(가용성), 갇힌 오탐·낡은 룰은 상한으로 강제 만료(자정작용)됩니다. 청소 주기는 `CLEANUP_INTERVAL`(기본 60초).
+   - **보관·재무장 (archive / re-arm):** 폐기(revoke)·만료된 룰은 **삭제하지 않고** `archived.conf` 에 폐기 사유(`false_positive` / `idle_ttl` / `max_age` / `undersampled` / `manual`)와 함께 보관됩니다. `GET /api/v1/rules/archived` 로 조회하고, **`POST /api/v1/rules/rearm/:id` 로 LLM 재생성 없이 shadow 로 재무장**합니다(deny였던 룰은 pass,log로 강등해 재검증부터). 같은 공격이 재유입돼도 즉시 복구 가능하므로, **잘못된 만료의 비용이 낮습니다.**
+   - **만료 임계값의 근거와 튜닝:** 5분(shadow) / 24h(idle) / 7일(절대 상한) / 최소표본 1 은 *실측 상수가 아니라 보수적 운영 기본값* 입니다 — 24h idle 은 "공격 캠페인이 끝났는지" 판단하는 무매칭 신호, 7일 상한은 룰 드리프트 방지를 위한 주기적 재평가 강제, 5분 shadow 는 오탐 표본 수집 최소창의 의미입니다. **핵심은 폐기가 물리 삭제가 아니라 보관(위 *재무장*)이라, 이 값들이 '정확히 최적'일 필요가 없다**는 점입니다(틀려도 재무장으로 복구). 트래픽이 많은 환경일수록 짧게, 적은 환경일수록 길게 조정하면 되고 전부 환경변수로 노출됩니다.
+   - **룰 수명 관리 API:** 사이드카가 `POST /api/v1/rules/promote/:id`(승격), `POST /api/v1/rules/revoke/:id`(보관 처리), `GET /api/v1/rules`(상태·만료시각 조회), `GET /api/v1/rules/archived`(보관 목록·사유), `POST /api/v1/rules/rearm/:id`(재무장)를 제공하여 슬랙 ChatOps 명령(기능 7)으로 직접 제어할 수 있습니다. (룰 변경 시 `nginx -s reload` 는 `RELOAD_DEBOUNCE_MS` 동안 모아 1회로 합칩니다 — reload 폭주 방지)
 
 7. **실시간 관제 및 긴급 오케스트레이션 (Analyzer)**
    - **Cloudflare WAF 연동:** 공격 IP에 대한 Cloudflare 방화벽 차단 API를 호출하여 해당 IP를 네트워크 엣지 단에서 영구 격리합니다.
@@ -120,7 +122,7 @@
      |---|---|
      | `차단해제 <IP>` | 해당 IP의 Cloudflare 차단 룰을 찾아 해제 (IPv4 형식 검증 후 삭제된 rule id 회신) |
      | `룰목록` | 사이드카 `GET /api/v1/rules` 로 주입된 AI 룰의 ID·본문과 **상태(shadow/live)·만료 예정시각(KST)** 을 조회 (최대 20개 표시) |
-     | `룰비활성 <id>` | 사이드카 `POST /api/v1/rules/revoke/:id` 로 지정 룰을 제거 (Shadow/Live 메모리 상태까지 정리) |
+     | `룰비활성 <id>` | 사이드카 `POST /api/v1/rules/revoke/:id` 로 지정 룰을 활성에서 내려 보관(archive) (Shadow/Live 메모리 상태까지 정리, `archived.conf` 에 보존) |
      | `보고` | 현재까지의 탐지 내역을 종합한 HTML 이메일 보고서를 수동 발송 |
    - **Email 연동:** SMTP 프로토콜을 통하여 관제 담당자의 편지함에 직관적이고 미려한 HTML 위협 분석 보고서를 발송합니다.
    - **리포트 수신:** `:5000` 의 `POST /api/v1/report` 로 파이프라인의 위협 리포트를 수신합니다.
@@ -232,8 +234,14 @@ Aegis-3/
 
 * **사이드카 룰 수명 관리 (선택 — `docker-compose.yml` 의 `nginx` 서비스 `environment`):**
   ```env
-  # Shadow Mode 관찰 시간(초). 이 시간 동안 오탐 0건이면 deny 승격, 1건 이상이면 폐기. 기본 300(5분)
+  # Shadow Mode 1차 관찰 시간(초). 기본 300(5분)
   SHADOW_DURATION=300
+
+  # 승격 최소 표본: '공격' 확정 매칭이 이 건수 미만이면 승격하지 않음(무매칭 0건 자동승격 방지). 기본 1
+  MIN_SHADOW_SAMPLES=1
+
+  # 표본 부족 시 관찰 연장 절대 상한(초). 이 시간까지도 표본 부족이면 보관 처리. 기본 3600(1h)
+  SHADOW_MAX_DURATION=3600
 
   # 하이브리드 TTL ①: 승격된 룰이 이 시간 동안 무매칭이면 제거(idle 만료). 기본 86400(24h)
   TTL_SECONDS=86400
@@ -243,6 +251,12 @@ Aegis-3/
 
   # 만료 룰 청소 주기(초). 기본 60(1분)
   CLEANUP_INTERVAL=60
+
+  # nginx -s reload 디바운스(ms). 몰린 룰 변경을 모아 reload 1회로 합침. 기본 2000
+  RELOAD_DEBOUNCE_MS=2000
+
+  # 폐기 룰 보관 파일(물리 삭제 대신 보관 → 재무장 가능). 기본 /etc/nginx/rules/archived.conf
+  RULE_ARCHIVE_FILE=/etc/nginx/rules/archived.conf
   ```
   > **Note:** 데모 시연 시에는 `SHADOW_DURATION=30`, `TTL_SECONDS=60` 처럼 짧게 두면 승격·만료 동작을 빠르게 관찰할 수 있습니다. 이 값들은 `.env` 가 아니라 compose 의 nginx 서비스 환경변수로 주입됩니다.
 

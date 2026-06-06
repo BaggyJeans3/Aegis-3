@@ -19,6 +19,21 @@ const CLEANUP_INTERVAL = parseInt(process.env.CLEANUP_INTERVAL || '60', 10)
 const AUDIT_LOG_PATH = process.env.AUDIT_LOG_PATH || '/var/log/coraza/audit.log'
 const rulePath = process.env.RULE_FILE || '/etc/nginx/rules/dynamic.conf'
 const nginxBin = process.env.NGINX_BIN || '/usr/sbin/nginx'
+// 폐기된 룰 보관 파일(nginx 가 include 하지 않는 별도 파일). 물리 삭제 대신 여기에 보관해
+// 재공격 시 LLM 재생성 없이 재무장(re-arm)하고, 폐기 근거를 추적한다.
+const RULE_ARCHIVE_FILE =
+  process.env.RULE_ARCHIVE_FILE || '/etc/nginx/rules/archived.conf'
+// Shadow 승격 최소 표본: '공격 확정' 매칭이 이 건수 미만이면 승격하지 않는다.
+// (과거: 매칭 0건도 FP=0 이라 자동 승격 → 검증 안 된 룰이 deny 로 올라가는 위험)
+const MIN_SHADOW_SAMPLES = parseInt(process.env.MIN_SHADOW_SAMPLES || '1', 10)
+// 표본 부족 시 shadow 관찰을 연장하는 절대 상한. 이 시간까지도 표본이 모자라면 보관 처리.
+// SHADOW_DURATION 보다 충분히 커야 연장이 의미 있음. 기본 1시간.
+const SHADOW_MAX_DURATION = parseInt(
+  process.env.SHADOW_MAX_DURATION || '3600',
+  10,
+)
+// nginx reload 디바운스(ms): 짧은 시간에 몰린 룰 변경을 모아 reload 1회로 합산.
+const RELOAD_DEBOUNCE_MS = parseInt(process.env.RELOAD_DEBOUNCE_MS || '2000', 10)
 
 // AI 동적 룰 ID 대역 (README 기준). 이 밖의 매칭 룰(CRS 9xxxxx·정적 커스텀)은
 // 사람이 검증한 룰이라 Shadow 판정의 교차검증(C) 신호로 신뢰한다.
@@ -55,6 +70,10 @@ const shadowStats = new Map() // rule_id → { total, attack, fp }
 // 승격된 라이브 룰들
 const liveRules = new Map() // rule_id → { promotedAt, lastMatchedAt }
 
+// 폐기(revoke)된 룰 보관소: 물리 삭제 대신 보관 → 재공격 시 LLM 재생성 없이 재무장 가능.
+// 프로세스 재시작 시 메모리는 사라지지만 파일(RULE_ARCHIVE_FILE)에는 영구 기록된다.
+const archivedRules = new Map() // rule_id → { ruleText, reason, archivedAt }
+
 // 시작 시 audit log 파일이 없으면 빈 파일로 만들어둠 (Tail 패키지가 에러 안 내게)
 try {
   fs.mkdirSync(path.dirname(AUDIT_LOG_PATH), { recursive: true })
@@ -65,9 +84,32 @@ try {
   console.error('[Sidecar] audit log init failed:', err.message)
 }
 
+// 보관 파일 디렉터리 보장(룰 디렉터리와 동일하지만, 부팅 순서와 무관하게 안전하게)
+try {
+  fs.mkdirSync(path.dirname(RULE_ARCHIVE_FILE), { recursive: true })
+} catch (err) {
+  console.error('[Sidecar] archive dir init failed:', err.message)
+}
+
 app.use(express.json({ limit: '256kb' }))
 
 app.get('/health', (_req, res) => res.json({ ok: true, rule_file: rulePath }))
+
+// 룰 액션 문자열의 중복 log/auditlog 토큰을 정리한다.
+// deny↔pass 변환을 inject/promote/rearm 에서 반복하면 ',log,auditlog' 가 매번
+// 덧붙어 불어나므로(재무장 반복 시 누적), 각 변환 직후 이 함수로 첫 토큰만 남긴다.
+function dedupeAction(ruleStr, tok) {
+  let seen = false
+  return ruleStr.replace(new RegExp(`,${tok}\\b`, 'g'), (m) => {
+    if (seen) return ''
+    seen = true
+    return m
+  })
+}
+function normalizeRuleActions(ruleStr) {
+  // auditlog 를 먼저(‘log’ 가 ‘auditlog’ 의 접미사라 ,log\b 는 ,auditlog 를 건드리지 않음)
+  return dedupeAction(dedupeAction(ruleStr, 'auditlog'), 'log')
+}
 
 app.post('/api/v1/rules/inject', (req, res) => {
   const newRule = req.body && req.body.rule
@@ -86,12 +128,16 @@ app.post('/api/v1/rules/inject', (req, res) => {
   if (shadowRules.has(ruleId) || liveRules.has(ruleId)) {
     return res.status(409).json({ error: `Rule ${ruleId} already exists` })
   }
+  // 같은 ID 가 보관소에 있으면 새 주입이 보관본을 대체 → 메모리에서 정리(파일 기록은 유지)
+  if (archivedRules.has(ruleId)) {
+    console.log(`[Sidecar] re-inject ${ruleId}: 기존 보관본 대체`)
+    archivedRules.delete(ruleId)
+  }
 
   // 2. deny 액션을 pass,log로 강제 변환 (Shadow Mode)
-  const shadowRule = newRule
-    .replace(/\bdeny\b/, 'pass,log,auditlog')
-    .replace(/,status:\d+/, '')
-    .replace(/,log,log,/, ',log,') // 중복 log 정리
+  const shadowRule = normalizeRuleActions(
+    newRule.replace(/\bdeny\b/, 'pass,log,auditlog').replace(/,status:\d+/, ''),
+  )
 
   // 3. 룰 파일에 추가
   try {
@@ -113,16 +159,9 @@ app.post('/api/v1/rules/inject', (req, res) => {
   shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
   console.log(`[Shadow] injected ${ruleId} (will judge in ${SHADOW_DURATION}s)`)
 
-  // 5. nginx reload
-  exec(`${nginxBin} -s reload`, (err, _stdout, stderr) => {
-    if (err) {
-      console.error('[Sidecar] nginx reload failed:', stderr || err.message)
-      return res
-        .status(500)
-        .json({ error: 'Reload failed', detail: stderr || err.message })
-    }
-    return res.json({ status: 'shadow_injected', rule_id: ruleId })
-  })
+  // 5. nginx reload (배치). 룰은 파일+메모리에 이미 반영됨, 적용만 합산 지연.
+  scheduleReload()
+  return res.json({ status: 'shadow_injected', rule_id: ruleId, reload: 'queued' })
 })
 
 app.post('/api/v1/rules/promote/:id', (req, res) => {
@@ -142,11 +181,71 @@ app.post('/api/v1/rules/revoke/:id', (req, res) => {
   if (isNaN(ruleId)) {
     return res.status(400).json({ error: 'Invalid rule_id' })
   }
-  const ok = revokeRule(ruleId)
+  const ok = revokeRule(ruleId, 'manual')
   if (ok) {
     return res.json({ status: 'revoked', rule_id: ruleId })
   }
   return res.status(404).json({ error: `Rule ${ruleId} not found` })
+})
+
+// 보관된 룰 목록 조회 — "왜/언제 폐기됐는지" 가시화 (보관/삭제 기준 추적용)
+app.get('/api/v1/rules/archived', (_req, res) => {
+  const archived = []
+  for (const [ruleId, info] of archivedRules) {
+    archived.push({
+      id: String(ruleId),
+      reason: info.reason,
+      archived_at: new Date(info.archivedAt).toISOString(),
+    })
+  }
+  return res.json({ archived, total: archived.length })
+})
+
+// 재무장(re-arm) — 보관된 룰을 LLM 재생성 없이 shadow 로 되살려 재검증한다.
+// 같은 공격이 다시 들어왔을 때 활용. deny 였더라도 다시 shadow(pass,log)로 강등해 검증부터.
+app.post('/api/v1/rules/rearm/:id', (req, res) => {
+  const ruleId = parseInt(req.params.id, 10)
+  if (isNaN(ruleId)) {
+    return res.status(400).json({ error: 'Invalid rule_id' })
+  }
+  const archived = archivedRules.get(ruleId)
+  if (!archived) {
+    return res.status(404).json({ error: `Rule ${ruleId} not in archive` })
+  }
+  if (shadowRules.has(ruleId) || liveRules.has(ruleId)) {
+    return res.status(409).json({ error: `Rule ${ruleId} already active` })
+  }
+
+  // 보관본의 룰 본문(첫 줄)을 shadow 형태로 되돌림
+  const shadowRule = normalizeRuleActions(
+    archived.ruleText
+      .split('\n')[0]
+      .replace(/\bdeny,status:\d+/, 'pass,log,auditlog')
+      .replace(/\bdeny\b/, 'pass,log,auditlog'),
+  )
+
+  try {
+    fs.appendFileSync(rulePath, shadowRule + '\n')
+  } catch (err) {
+    console.error('[Re-arm] rule write failed:', err.message)
+    return res
+      .status(500)
+      .json({ error: 'Rule write failed', detail: err.message })
+  }
+
+  shadowRules.set(ruleId, {
+    startedAt: Date.now(),
+    ruleText: shadowRule,
+    expiresAt: Date.now() + TTL_SECONDS * 1000,
+  })
+  shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
+  archivedRules.delete(ruleId)
+  console.log(
+    `[Re-arm] ${ruleId} restored from archive (was ${archived.reason}) → shadow`,
+  )
+
+  scheduleReload()
+  return res.json({ status: 'rearmed_shadow', rule_id: ruleId, reload: 'queued' })
 })
 
 // ============================================================
@@ -365,41 +464,64 @@ function startLogWatcher() {
 startLogWatcher()
 console.log(`[Scheduler] shadow expiration check every 10s`)
 console.log(
+  `[Scheduler] shadow: duration=${SHADOW_DURATION}s, min_samples=${MIN_SHADOW_SAMPLES}, max_duration=${SHADOW_MAX_DURATION}s`,
+)
+console.log(
   `[Scheduler] TTL cleanup every ${CLEANUP_INTERVAL}s, idle TTL=${TTL_SECONDS}s, max age=${MAX_RULE_AGE_SECONDS}s`,
 )
+console.log(`[Sidecar] revoke=보관(archive) 모드, archive_file=${RULE_ARCHIVE_FILE}`)
+if (SHADOW_MAX_DURATION < SHADOW_DURATION) {
+  console.warn(
+    `[Sidecar] 경고: SHADOW_MAX_DURATION(${SHADOW_MAX_DURATION}s) < SHADOW_DURATION(${SHADOW_DURATION}s) → 관찰 연장이 동작하지 않음`,
+  )
+}
 
 // ============================================================
 // 5분 만료 체크 — Shadow 끝난 룰 판정
 // ============================================================
 function checkShadowExpirations() {
   const now = Date.now()
-  const expired = []
+  const decided = [] // 판정 끝나 shadow 상태에서 내릴 룰들
 
   for (const [ruleId, info] of shadowRules) {
-    if (now - info.startedAt >= SHADOW_DURATION * 1000) {
-      expired.push(ruleId)
-    }
-  }
+    const elapsed = now - info.startedAt
+    if (elapsed < SHADOW_DURATION * 1000) continue // 아직 1차 관찰 중
 
-  for (const ruleId of expired) {
     const stats = shadowStats.get(ruleId) || { total: 0, attack: 0, fp: 0 }
+
     if (stats.fp > 0) {
-      // 정상 트래픽이 한 건이라도 매칭 → 차단 시 오탐 위험 → 폐기 (정상 0건 차단 보장)
+      // 정상 트래픽이 한 건이라도 매칭 → 차단 시 오탐 위험 → 보관 (정상 0건 차단 보장)
       console.log(
         `[Shadow] revoking ${ruleId} (오탐 의심 ${stats.fp}건, 공격 ${stats.attack}건) — 정상 트래픽 보호`,
       )
-      revokeRule(ruleId)
-    } else if (stats.attack > 0) {
-      // 공격만 매칭, 오탐 0 → 승격
+      revokeRule(ruleId, 'false_positive')
+      decided.push(ruleId)
+    } else if (stats.attack >= MIN_SHADOW_SAMPLES) {
+      // 공격 표본 충분 + 오탐 0 → 승격
       console.log(
-        `[Shadow] promoting ${ruleId} (공격 ${stats.attack}건, 오탐 0)`,
+        `[Shadow] promoting ${ruleId} (공격 ${stats.attack}건 ≥ 최소표본 ${MIN_SHADOW_SAMPLES}, 오탐 0)`,
       )
       promoteRule(ruleId)
+      decided.push(ruleId)
+    } else if (elapsed < SHADOW_MAX_DURATION * 1000) {
+      // 표본 부족(공격 ${stats.attack} < ${MIN_SHADOW_SAMPLES}, 오탐 0):
+      // 검증 근거가 모자라므로 승격하지 않고 관찰을 연장한다(절대 상한까지).
+      // shadowRules 에서 내리지 않음 → 다음 tick 에 재평가. (반복 로그 방지 위해 무출력)
     } else {
-      // 매칭 자체가 없음 → 승격 (FP=0)
-      console.log(`[Shadow] promoting ${ruleId} (매칭 없음, FP=0)`)
-      promoteRule(ruleId)
+      // 절대 상한까지도 표본 부족 → 끝내 검증 불가 → 보관(미검증 룰 자동 deny 금지).
+      // 재공격이 들어오면 /api/v1/rules/rearm 으로 재무장 가능.
+      console.log(
+        `[Shadow] archiving ${ruleId} (표본 부족: 공격 ${stats.attack}건 < ${MIN_SHADOW_SAMPLES}, ${Math.floor(
+          elapsed / 1000,
+        )}s 관찰) — 미검증 룰 보류`,
+      )
+      revokeRule(ruleId, 'undersampled')
+      decided.push(ruleId)
     }
+  }
+
+  // promote 한 룰은 shadow 잔여 상태 제거(revoke 는 내부에서 이미 정리됨; 중복 delete 무해)
+  for (const ruleId of decided) {
     shadowRules.delete(ruleId)
     shadowStats.delete(ruleId)
   }
@@ -434,11 +556,56 @@ function checkTTLExpirations() {
       const idleSec = Math.floor((now - info.lastMatchedAt) / 1000)
       console.log(`[TTL] removing ${ruleId} (no match for ${idleSec}s)`)
     }
-    revokeRule(ruleId) // revokeRule이 liveRules.delete까지 다 처리함
+    // idle 만료/절대 상한 모두 '미사용'이라 보관 → 재공격 시 재무장 가능
+    revokeRule(ruleId, reason === 'max_age' ? 'max_age' : 'idle_ttl')
   }
 }
 
 setInterval(checkTTLExpirations, CLEANUP_INTERVAL * 1000)
+
+// ============================================================
+// nginx reload 코얼레서(batching) — 짧은 시간에 몰린 inject/promote/revoke 의
+// 개별 reload 를 1회로 합친다. 특히 TTL 청소가 한 tick 에 여러 룰을 내릴 때
+// reload N회 → 1회로 줄여 reload 폭주를 막는다. 룰 변경 자체(파일+메모리)는
+// 즉시 반영되고, nginx 적용(reload)만 지연·합산된다.
+// ============================================================
+let reloadTimer = null
+let reloadPending = false
+let reloadInFlight = false
+
+function scheduleReload() {
+  reloadPending = true
+  armReloadTimer()
+}
+
+function armReloadTimer() {
+  if (reloadTimer || reloadInFlight) return
+  reloadTimer = setTimeout(() => {
+    reloadTimer = null
+    fireReload()
+  }, RELOAD_DEBOUNCE_MS)
+}
+
+function fireReload() {
+  if (reloadInFlight || !reloadPending) return
+  reloadPending = false
+  reloadInFlight = true
+  exec(`${nginxBin} -s reload`, (err, _stdout, stderr) => {
+    reloadInFlight = false
+    if (err) {
+      // 설정 검증 실패 시 nginx 는 이전 설정을 유지한다. 무한 재시도 루프를 피하기 위해
+      // pending 만 세워두고, 다음 룰 변경(scheduleReload) 때 자연히 재시도되게 한다.
+      reloadPending = true
+      console.error(
+        '[Reload] batched reload 실패(이전 설정 유지):',
+        stderr || err.message,
+      )
+      return
+    }
+    console.log('[Reload] batched reload 적용 완료')
+    if (reloadPending) armReloadTimer() // reload 중 도착한 변경 반영
+  })
+}
 
 function promoteRule(ruleId) {
   try {
@@ -449,9 +616,8 @@ function promoteRule(ruleId) {
       if (line.includes(`id:${ruleId}`)) {
         found = true
         // pass,log,auditlog → deny,status:403,log,auditlog 로 교체
-        return line.replace(
-          /\bpass,log,auditlog\b/,
-          'deny,status:403,log,auditlog',
+        return normalizeRuleActions(
+          line.replace(/\bpass,log,auditlog\b/, 'deny,status:403,log,auditlog'),
         )
       }
       return line
@@ -473,14 +639,9 @@ function promoteRule(ruleId) {
       expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
     })
 
-    // nginx reload
-    exec(`${nginxBin} -s reload`, (err) => {
-      if (err) {
-        console.error(`[Promote] reload failed for ${ruleId}:`, err.message)
-      } else {
-        console.log(`[Promote] ${ruleId} promoted to deny + reloaded`)
-      }
-    })
+    // nginx reload (배치)
+    console.log(`[Promote] ${ruleId} promoted to deny (reload queued)`)
+    scheduleReload()
     return true
   } catch (err) {
     console.error(`[Promote] error for ${ruleId}:`, err.message)
@@ -488,9 +649,27 @@ function promoteRule(ruleId) {
   }
 }
 
-function revokeRule(ruleId) {
+// 폐기되는 룰 원문을 보관 파일 + 메모리에 적재한다(물리 삭제 대신 보관).
+// reason: 'false_positive' | 'idle_ttl' | 'max_age' | 'undersampled' | 'manual'
+function archiveRule(ruleId, ruleText, reason) {
+  archivedRules.set(ruleId, { ruleText, reason, archivedAt: Date.now() })
+  try {
+    const stamp = new Date().toISOString()
+    fs.appendFileSync(
+      RULE_ARCHIVE_FILE,
+      `# archived id=${ruleId} reason=${reason} at=${stamp}\n${ruleText}\n`,
+    )
+  } catch (err) {
+    console.error(`[Archive] write failed for ${ruleId}:`, err.message)
+  }
+}
+
+// 룰을 활성 룰 파일(dynamic.conf)에서 내린다. 단, 삭제하지 않고 보관(archive)하여
+// 재공격 시 재무장(/api/v1/rules/rearm)으로 LLM 재생성 없이 복구할 수 있게 한다.
+function revokeRule(ruleId, reason = 'manual') {
   try {
     const lines = fs.readFileSync(rulePath, 'utf8').split('\n')
+    const removed = lines.filter((line) => line.includes(`id:${ruleId}`))
     const newLines = lines.filter((line) => !line.includes(`id:${ruleId}`))
 
     if (newLines.length === lines.length) {
@@ -503,20 +682,18 @@ function revokeRule(ruleId) {
       return false
     }
 
+    // 물리 삭제 대신 보관: 폐기 근거(reason) 추적 + 재공격 시 재무장 가능
+    archiveRule(ruleId, removed.join('\n'), reason)
+
     fs.writeFileSync(rulePath, newLines.join('\n'))
 
-    // 모든 상태에서 제거
+    // 활성 상태에서만 제거 (archivedRules 에는 남겨둠)
     shadowRules.delete(ruleId)
     shadowStats.delete(ruleId)
     liveRules.delete(ruleId)
 
-    exec(`${nginxBin} -s reload`, (err) => {
-      if (err) {
-        console.error(`[Revoke] reload failed for ${ruleId}:`, err.message)
-      } else {
-        console.log(`[Revoke] ${ruleId} removed + reloaded`)
-      }
-    })
+    console.log(`[Revoke] ${ruleId} archived (reason=${reason}), reload queued`)
+    scheduleReload()
     return true
   } catch (err) {
     console.error(`[Revoke] error for ${ruleId}:`, err.message)

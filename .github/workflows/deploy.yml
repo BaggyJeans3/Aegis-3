@@ -74,8 +74,8 @@ jobs:
             sudo docker system prune -af
             sudo docker builder prune -af
 
-            # 도커 실행
-            sudo docker compose up -d --build
+            # 도커 실행 (EC2 운영용 override 포함: nginx 를 host 80 에 게시 → Cloudflare 프록시 연결)
+            sudo docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
             # DB 스키마 보강 (볼륨 보존 환경이라 init.sql이 재실행되지 않으므로,
             # 이미 존재하는 tenants 테이블에 신규 컬럼을 직접 추가)

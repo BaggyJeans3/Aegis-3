@@ -1,0 +1,18 @@
+# ──────────────────────────────────────────────────────────────────────────
+# EC2(운영) 전용 override.
+#
+# 로컬 개발은 docker-compose.yml 만 사용해 nginx 를 host 8080 에 게시한다
+# (개발 머신에서 권한 포트 80 충돌 회피). 운영(EC2)에서는 Cloudflare 프록시가
+# origin 을 기본 포트 80 으로 접속하므로, nginx 를 host 80 에 게시해야 한다.
+#
+# 사용(EC2):
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# ports 의 `!override` 는 base 의 '8080:80' 을 합치지 않고 교체한다(80 만 게시).
+# → 보안그룹이 80/443(Cloudflare 대역)만 허용하므로 8080 은 굳이 열지 않는다.
+# (Cloudflare SSL/TLS 모드 = Flexible: 사용자↔CF=HTTPS, CF↔EC2=HTTP/80)
+# ──────────────────────────────────────────────────────────────────────────
+services:
+  nginx:
+    ports: !override
+      - '80:80'

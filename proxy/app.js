@@ -20,19 +20,26 @@ app.use(async (req, res, next) => {
   const clientIp = getClientIp(req);
 
   if (clientIp && clientIp !== 'unknown') {
-    try {
-      const isBlocked = await redisClient.exists(`aegis:blacklist:${clientIp}`);
-      if (isBlocked) {
-        console.log(`[BLOCKED] ${req.method} ${req.headers.host}${req.path} from ${clientIp} — IP blacklist hit`);
-        // 통계 카운터 (대시보드용, 실패해도 차단 동작은 계속)
-        redisClient.incr('aegis:stats:proxy_blocked').catch(() => {});
-        return res.status(403).json({
-          status: 'forbidden',
-          message: 'Access denied',
-        });
+    if (!redisHealthy) {
+      // Redis 비정상으로 이미 인지된 상태 → 조회 자체를 건너뛰고 통과(fail-open).
+      // (조회를 시도하면 disconnect 중 멈추거나 reject 되므로, 아예 선차단해 즉시 통과)
+      noteFailOpen('redis unhealthy');
+    } else {
+      try {
+        const isBlocked = await redisClient.exists(`aegis:blacklist:${clientIp}`);
+        if (isBlocked) {
+          console.log(`[BLOCKED] ${req.method} ${req.headers.host}${req.path} from ${clientIp} — IP blacklist hit`);
+          // 통계 카운터 (대시보드용, 실패해도 차단 동작은 계속)
+          redisClient.incr('aegis:stats:proxy_blocked').catch(() => {});
+          return res.status(403).json({
+            status: 'forbidden',
+            message: 'Access denied',
+          });
+        }
+      } catch (err) {
+        // healthy 였지만 조회 순간 끊긴 레이스 → disableOfflineQueue 로 즉시 reject → 통과
+        noteFailOpen(err.message);
       }
-    } catch (err) {
-      console.warn(`[Aegis-3] Redis 블랙리스트 조회 실패(ip=${clientIp}): ${err.message} — fail-open으로 요청 통과`);
     }
   }
 
@@ -65,7 +72,52 @@ const redisClient = redis.createClient({
     host: process.env.REDIS_HOST || 'redis',
     port: Number(process.env.REDIS_PORT || 6379),
   },
+  // Redis 다운 시 명령을 큐에 쌓지 않고 즉시 reject 한다. 이게 없으면 disconnect 중
+  // exists() 가 offline 큐에 걸려 await 가 멈추고, 블랙리스트 미들웨어가 모든 라우트
+  // 앞에 있으므로 전체 요청(심지어 /health)이 행(hang)된다 → fail-open 이 무력화됨.
+  disableOfflineQueue: true,
 });
+
+// ──────────────────────────────────────────────────────────
+// [Aegis-3] Redis 상태 추적 + fail-open 경보
+// 블랙리스트 차단은 Redis 의존이라, Redis 가 죽으면 차단이 '조용히' 비활성된다.
+// Redis 가 죽었을 땐 Redis 에 메트릭을 쓸 수 없으므로(같은 장애), 인프로세스
+// 카운터 + 구분 가능한 [ALERT] 로그 + /health 본문으로 외부 모니터링이 감지하게 한다.
+// (error 리스너 미등록 시 node-redis 가 프로세스를 죽일 수 있어 반드시 등록)
+// ──────────────────────────────────────────────────────────
+let redisHealthy = false;
+let redisFailOpenCount = 0; // 블랙리스트 조회 실패로 통과(fail-open)시킨 요청 누적
+let lastRedisDownLog = 0; // 다운 상태 반복 로그 쓰로틀(ms)
+
+redisClient.on('ready', () => {
+  if (!redisHealthy) {
+    console.warn('[Aegis-3][ALERT] Redis 복구 — IP 블랙리스트 차단 재가동');
+  }
+  redisHealthy = true;
+});
+redisClient.on('error', (err) => {
+  if (redisHealthy) {
+    console.error(
+      `[Aegis-3][ALERT] Redis 다운 — IP 블랙리스트 차단 비활성(fail-open): ${err.message}`
+    );
+  }
+  redisHealthy = false;
+});
+redisClient.on('end', () => {
+  redisHealthy = false;
+});
+
+// fail-open(블랙리스트 조회 생략/실패로 통과) 1건을 계측 + 쓰로틀된 [ALERT] 로그.
+function noteFailOpen(reason) {
+  redisFailOpenCount += 1;
+  const now = Date.now();
+  if (now - lastRedisDownLog > 10000) {
+    console.error(
+      `[Aegis-3][ALERT] 블랙리스트 조회 생략/실패 — fail-open 통과(누적 ${redisFailOpenCount}건): ${reason}`
+    );
+    lastRedisDownLog = now;
+  }
+}
 
 function normalizeHost(hostHeader) {
   if (!hostHeader) return '';
@@ -317,10 +369,20 @@ function sendAccessEvent(req, route) {
 }
 
 app.get('/health', (req, res) => {
+  // 프로세스 자체는 살아있으므로 항상 200(liveness). Redis 가 죽어도 컨테이너를
+  // 재시작하지 않는다(fail-open 의도). 블랙리스트 차단 가동 여부는 본문으로 노출하고,
+  // 모니터링은 blacklist_enforced=false 또는 [ALERT] 로그로 경보를 건다.
+  const blacklistEnforced = redisClient.isOpen && redisHealthy;
   return res.status(200).json({
-    status: 'ok',
+    status: blacklistEnforced ? 'ok' : 'degraded',
     service: 'aegis3-proxy',
     route_count: routeCache.length,
+    redis: {
+      connected: redisClient.isOpen,
+      healthy: redisHealthy,
+      blacklist_enforced: blacklistEnforced,
+      fail_open_count: redisFailOpenCount,
+    },
   });
 });
 
