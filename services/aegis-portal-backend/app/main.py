@@ -43,7 +43,13 @@ from .database import connect_to_mongo, close_mongo_connection, get_collection
 from .seed_data import generate_logs               # [길1 전용]
 from .stream_source import event_stream
 from .postgres import connect_to_postgres, close_postgres_connection
-from .customers import create_customer, list_customers, list_owned_tenant_ids
+from .customers import (
+    create_customer,
+    list_customers,
+    list_owned_tenant_ids,
+    get_admin_tenant_summary,
+    list_all_tenants_for_admin,
+)
 from .auth import get_current_user, get_auth_context, AuthContext
 
 
@@ -389,3 +395,39 @@ async def get_customers(user: dict = Depends(get_current_user)):
         )
     customers = await list_customers(supabase_user_id)
     return {"customers": customers}
+
+@app.get("/api/admin/tenants/summary")
+async def admin_tenants_summary(
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """
+    관리자 대시보드 카드용 요약.
+      - 전체 / 활성 / 비활성 / 정지 고객사 수
+      - 가장 최근 가입한 고객사
+    admin 만 호출 가능. customer 가 호출하면 403.
+    """
+    if not ctx.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="관리자 전용 엔드포인트입니다.",
+        )
+    return await get_admin_tenant_summary()
+ 
+ 
+@app.get("/api/admin/tenants")
+async def admin_all_tenants(
+    ctx: AuthContext = Depends(get_auth_context),
+):
+    """
+    관리자가 보는 전체 고객사 목록.
+    각 tenant 에 등록된 도메인 정보(routers JOIN)도 같이 반환.
+    admin 만 호출 가능. customer 가 호출하면 403.
+    """
+    if not ctx.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="관리자 전용 엔드포인트입니다.",
+        )
+    tenants = await list_all_tenants_for_admin()
+    return {"tenants": tenants, "total": len(tenants)}
+ 

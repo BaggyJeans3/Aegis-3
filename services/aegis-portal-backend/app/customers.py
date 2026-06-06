@@ -129,3 +129,97 @@ async def list_owned_tenant_ids(supabase_user_id: str) -> list[str]:
         su_id,
     )
     return [str(r["tenant_id"]) for r in rows]
+
+
+# ============================================================
+# [추가] Admin 전용 함수 - AdminDashboardPage 의 카드/목록용
+# ============================================================
+
+async def get_admin_tenant_summary() -> dict:
+    """
+    관리자 대시보드 카드용 집계 정보.
+      - 등록된 고객사 수 (전체)
+      - 활성 상태 고객사 수
+      - 최근 가입한 고객사 (회사명 + 가입일)
+    한 번의 쿼리로 다 처리.
+    """
+    pool = get_pool()
+    async with pool.acquire() as conn:
+        # 카운트 집계 (전체 + 상태별)
+        counts = await conn.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COUNT(*) FILTER (WHERE status = 'active') AS active_count,
+                COUNT(*) FILTER (WHERE status = 'inactive') AS inactive_count,
+                COUNT(*) FILTER (WHERE status = 'suspended') AS suspended_count
+            FROM tenants
+            """
+        )
+
+        # 가장 최근 가입 1건
+        latest = await conn.fetchrow(
+            """
+            SELECT company_name, created_at
+            FROM tenants
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        )
+
+    return {
+        "total": counts["total"],
+        "active_count": counts["active_count"],
+        "inactive_count": counts["inactive_count"],
+        "suspended_count": counts["suspended_count"],
+        "latest_company": latest["company_name"] if latest else None,
+        "latest_created_at": latest["created_at"].isoformat() if latest else None,
+    }
+
+
+async def list_all_tenants_for_admin() -> list[dict]:
+    """
+    관리자가 보는 전체 고객사 목록.
+    routers 와 LEFT JOIN 해서 등록한 도메인 정보도 같이 반환.
+    """
+    pool = get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT
+            t.tenant_id,
+            t.company_name,
+            t.plan_type,
+            t.status,
+            t.created_at,
+            t.supabase_user_id,
+            COALESCE(
+                json_agg(
+                    json_build_object(
+                        'inbound_domain', r.inbound_domain,
+                        'target_origin', r.target_origin,
+                        'action', r.action_on_match
+                    )
+                ) FILTER (WHERE r.route_id IS NOT NULL),
+                '[]'::json
+            ) AS routes
+        FROM tenants t
+        LEFT JOIN routers r
+            ON t.tenant_id = r.tenant_id AND r.is_active = TRUE
+        GROUP BY
+            t.tenant_id, t.company_name, t.plan_type,
+            t.status, t.created_at, t.supabase_user_id
+        ORDER BY t.created_at DESC
+        """
+    )
+    return [
+        {
+            "tenant_id": str(r["tenant_id"]),
+            "company_name": r["company_name"],
+            "plan_type": r["plan_type"],
+            "status": r["status"],
+            "created_at": r["created_at"].isoformat(),
+            "supabase_user_id": str(r["supabase_user_id"]) if r["supabase_user_id"] else None,
+            "routes": r["routes"],
+        }
+        for r in rows
+    ]
