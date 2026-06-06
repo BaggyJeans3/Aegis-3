@@ -8,6 +8,7 @@
 
 api_key 는 백엔드가 자동 생성한다.
 """
+import json
 import secrets
 import uuid
 
@@ -181,6 +182,9 @@ async def list_all_tenants_for_admin() -> list[dict]:
     """
     관리자가 보는 전체 고객사 목록.
     routers 와 LEFT JOIN 해서 등록한 도메인 정보도 같이 반환.
+
+    asyncpg 는 json_agg 결과를 문자열로 반환할 수 있어서,
+    routes 를 명시적으로 json.loads 로 파싱해서 항상 배열로 반환.
     """
     pool = get_pool()
     rows = await pool.fetch(
@@ -211,6 +215,18 @@ async def list_all_tenants_for_admin() -> list[dict]:
         ORDER BY t.created_at DESC
         """
     )
+
+    def _parse_routes(value):
+        """asyncpg 가 문자열로 줄 수도, 이미 list 로 줄 수도 있어서 양쪽 다 처리."""
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return []
+        if isinstance(value, list):
+            return value
+        return []
+
     return [
         {
             "tenant_id": str(r["tenant_id"]),
@@ -219,7 +235,7 @@ async def list_all_tenants_for_admin() -> list[dict]:
             "status": r["status"],
             "created_at": r["created_at"].isoformat(),
             "supabase_user_id": str(r["supabase_user_id"]) if r["supabase_user_id"] else None,
-            "routes": r["routes"],
+            "routes": _parse_routes(r["routes"]),
         }
         for r in rows
     ]
