@@ -132,6 +132,34 @@ async def list_owned_tenant_ids(supabase_user_id: str) -> list[str]:
     return [str(r["tenant_id"]) for r in rows]
 
 
+async def list_owned_domains(supabase_user_id: str) -> list[str]:
+    """
+    특정 회원이 소유한 모든 inbound_domain 목록 반환.
+
+    Coraza 차단 트래픽은 sidecar 가 host→tenant 매핑에 실패하면 tenant_id=null 로
+    저장되고 raw_event.host 에 도메인만 남는다. 이 경우에도 본인 고객사 차단 로그를
+    보여주려면 tenant_id 매칭 외에 host 매칭도 필요하므로, 본인 소유 도메인을 반환한다.
+    """
+    try:
+        su_id = uuid.UUID(supabase_user_id)
+    except (ValueError, AttributeError, TypeError):
+        return []
+
+    pool = get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT r.inbound_domain
+        FROM routers r
+        JOIN tenants t ON r.tenant_id = t.tenant_id
+        WHERE t.supabase_user_id = $1
+          AND r.is_active = TRUE
+          AND r.inbound_domain IS NOT NULL
+        """,
+        su_id,
+    )
+    return [r["inbound_domain"] for r in rows if r["inbound_domain"]]
+
+
 # ============================================================
 # [추가] Admin 전용 함수 - AdminDashboardPage 의 카드/목록용
 # ============================================================

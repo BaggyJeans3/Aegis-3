@@ -55,6 +55,7 @@ from .customers import (
     create_customer,
     list_customers,
     list_owned_tenant_ids,
+    list_owned_domains,
     get_admin_tenant_summary,
     list_all_tenants_for_admin,
 )
@@ -125,6 +126,10 @@ def _to_frontend_schema(doc: dict) -> dict:
     except (TypeError, ValueError):
         normalized_score = 0.0
 
+    # tenant_id 가 null/'' 이면(예: Coraza 차단 로그가 host→tenant 매핑 실패 시)
+    # host 를 표시용 tenant 힌트로 사용. (실제 필터는 _resolve_tenant_filter 가 host 로 매칭)
+    display_tenant_id = raw.get("tenant_id") or raw.get("host") or "unknown"
+
     return {
         "_id": str(doc.get("_id", "")),
         "event": {
@@ -132,7 +137,7 @@ def _to_frontend_schema(doc: dict) -> dict:
             "timestamp": raw.get("timestamp") or doc.get("created_at"),
         },
         "subject": {
-            "tenant_id": raw.get("tenant_id"),
+            "tenant_id": display_tenant_id,
             "user": {
                 # soar 에 user.id 가 없으므로 session_id 일부를 사용
                 "id": (raw.get("session_id") or "unknown")[:32],
@@ -190,23 +195,47 @@ async def _resolve_tenant_filter(
             return {"raw_event.tenant_id": requested_tenant_id}
         return None  # 전체
 
-    # customer: 본인 소유 tenant 만
-    owned = await list_owned_tenant_ids(ctx.user_id)
-    if not owned:
-        # 등록한 고객사가 없으면 어떤 로그도 못 봄
+    # customer: 본인 소유 tenant_id 매칭 + 본인 소유 도메인(host) 매칭 (OR).
+    # Coraza 차단 로그가 host→tenant 매핑 실패로 tenant_id=null 이어도,
+    # 본인 도메인으로 들어온 트래픽이면 본인 화면에 보이도록 host 로도 매칭한다.
+    owned_tenants = await list_owned_tenant_ids(ctx.user_id)
+    owned_domains = await list_owned_domains(ctx.user_id)
+
+    if not owned_tenants and not owned_domains:
+        # 등록한 고객사 자체가 없으면 어떤 로그도 못 봄
         return {"raw_event.tenant_id": {"$in": []}}  # 0개 매칭
 
     if requested_tenant_id:
         # 요청한 tenant 가 본인 소유인지 확인
-        if requested_tenant_id not in owned:
+        if requested_tenant_id not in owned_tenants:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="해당 tenant 에 접근 권한이 없습니다.",
             )
-        return {"raw_event.tenant_id": requested_tenant_id}
+        or_conditions = [{"raw_event.tenant_id": requested_tenant_id}]
+        if owned_domains:
+            # 그 도메인으로 들어온 tenant_id=null 차단 로그도 함께
+            or_conditions.append({
+                "raw_event.host": {"$in": owned_domains},
+                "raw_event.tenant_id": {"$in": [None, ""]},
+            })
+        return {"$or": or_conditions}
 
-    # tenant 지정 안 했으면 본인 소유 전체
-    return {"raw_event.tenant_id": {"$in": owned}}
+    # tenant 미지정 -> 본인 소유 tenant 전체 + 본인 도메인 차단로그(tenant null)
+    or_conditions = []
+    if owned_tenants:
+        or_conditions.append({"raw_event.tenant_id": {"$in": owned_tenants}})
+    if owned_domains:
+        or_conditions.append({
+            "raw_event.host": {"$in": owned_domains},
+            "raw_event.tenant_id": {"$in": [None, ""]},
+        })
+
+    if not or_conditions:
+        return {"raw_event.tenant_id": {"$in": []}}
+    if len(or_conditions) == 1:
+        return or_conditions[0]
+    return {"$or": or_conditions}
 
 
 @app.get("/api/health")
