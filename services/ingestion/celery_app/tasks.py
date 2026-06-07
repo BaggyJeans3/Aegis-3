@@ -243,6 +243,24 @@ def build_mongo_document(raw_event, analyzer_result):
     detection_result = analyzer_result.get("detection_result", {})
     alert_event = analyzer_result.get("alert_event")
 
+    risk_score = detection_result.get("risk_score")
+    level = detection_result.get("level")
+    alert = detection_result.get("alert")
+    reasons = detection_result.get("reasons", [])
+    action = detection_result.get("action_on_match", raw_event.get("action_on_match"))
+
+    # [확정 악성 격상] Coraza 차단(SQLi/XSS 등)·허니팟·block 액션은 '이미 확정된 공격'이다.
+    # 그런데 Risk Score 엔진 detector 는 SQLi/XSS 를 점수화하지 않아(그건 WAF 몫)
+    # 차단된 공격이 LOW 로 표시되는 모순이 생긴다. → 휴리스틱 점수와 무관하게 CRITICAL 로 격상.
+    ev_type = str(raw_event.get("event_type") or "").lower()
+    action_l = str(action or "").lower()
+    if ev_type in ("waf_blocked", "blocked_request", "honeypot_hit") or action_l in ("block", "honeypot"):
+        risk_score = 100
+        level = "CRITICAL"
+        alert = True
+        if not reasons:
+            reasons = [f"확정 악성 이벤트({ev_type or action_l}) — 자동 CRITICAL 격상"]
+
     return {
         "event_id": raw_event.get("event_id"),
         "trace_id": raw_event.get("trace_id"),
@@ -251,19 +269,16 @@ def build_mongo_document(raw_event, analyzer_result):
 
         "security_analysis": {
             "status": "analyzed",
-            "risk_score": detection_result.get("risk_score"),
-            "level": detection_result.get("level"),
-            "alert": detection_result.get("alert"),
+            "risk_score": risk_score,
+            "level": level,
+            "alert": alert,
             "rule_hits": detection_result.get("rule_hits", []),
-            "reasons": detection_result.get("reasons", []),
+            "reasons": reasons,
             "analysis_profile": detection_result.get(
                 "analysis_profile",
                 raw_event.get("analysis_profile")
             ),
-            "action_on_match": detection_result.get(
-                "action_on_match",
-                raw_event.get("action_on_match")
-            ),
+            "action_on_match": action,
         },
 
         # 지금 단계에서는 LLM/대응 호출은 보류.
