@@ -192,6 +192,31 @@ async function loadRoutesFromDB() {
   routeCache = result.rows;
 
   console.log(`[ROUTE CACHE] ${routeCache.length} routes loaded`);
+
+  // [추가] host→tenant 매핑을 Redis(aegis:routes)에 발행.
+  // nginx 사이드카가 Coraza 차단 이벤트에 tenant_id 를 태깅할 때 사용한다
+  // (사이드카엔 DB 가 없으므로). periodic refresh 로 자동 갱신됨.
+  if (redisClient.isOpen) {
+    try {
+      const map = {};
+      for (const r of routeCache) {
+        const key = normalizeHost(r.inbound_domain);
+        if (key && !map[key]) {
+          map[key] = JSON.stringify({
+            tenant_id: r.tenant_id,
+            company_name: r.company_name,
+          });
+        }
+      }
+      await redisClient.del('aegis:routes');
+      if (Object.keys(map).length > 0) {
+        await redisClient.hSet('aegis:routes', map);
+      }
+      console.log(`[ROUTE CACHE] published ${Object.keys(map).length} host→tenant mappings to Redis`);
+    } catch (err) {
+      console.error('[ROUTE CACHE] Redis 발행 실패:', err.message);
+    }
+  }
 }
 
 function findRouteFromCache(host, path, method) {

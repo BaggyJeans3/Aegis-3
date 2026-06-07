@@ -397,47 +397,63 @@ async function classifyShadowMatch(ruleId, crsCorroborated, ip) {
 
 // Coraza 가 차단한 트랜잭션을 Redis 큐로 적재 → worker 가 MongoDB(traffic_logs)에 저장.
 // proxy 를 거치지 않고 엣지에서 끊긴 SQLi/XSS 등이 대시보드에 보이게 하는 경로.
-function maybePushBlockedEvent(txn, ids) {
-  // 차단 신호룰(949110 등)이 매칭됐을 때만 = 실제 deny 된 요청
-  const blocked = ids.some((id) => BLOCK_SIGNAL_RULE_IDS.includes(id))
-  if (!blocked) return
-  if (!redisReady) {
-    console.warn('[WAFLog] Redis 미연결 — 차단 이벤트 적재 skip')
-    return
-  }
+async function maybePushBlockedEvent(txn, ids) {
+  try {
+    // 차단 신호룰(949110 등)이 매칭됐을 때만 = 실제 deny 된 요청
+    const blocked = ids.some((id) => BLOCK_SIGNAL_RULE_IDS.includes(id))
+    if (!blocked) return
+    if (!redisReady) {
+      console.warn('[WAFLog] Redis 미연결 — 차단 이벤트 적재 skip')
+      return
+    }
 
-  const eventId = `waf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
-  const event = {
-    event_id: eventId,
-    trace_id: `trace-${eventId}`,
-    timestamp: new Date().toISOString(),
-    event_type: 'waf_blocked',
-    analysis_profile: 'full',
-    // host→tenant_id(UUID) 매핑은 사이드카에 DB 가 없어 생략(null).
-    // 현재는 admin 대시보드(필터 없음)에 표시됨. 고객사 뷰 표시는 후속 과제.
-    tenant_id: null,
-    company_name: null,
-    ip: txn.ip || 'unknown',
-    session_id: 'unknown',
-    method: txn.method || 'GET',
-    host: txn.host || null,
-    path: txn.path || '/',
-    query: txn.query || '',
-    headers: {},
-    body: '',
-    status_code: 403,
-    action_on_match: 'block',
-    waf_rule_hits: ids, // 매칭된 CRS 룰 ID 전체 (참고용)
-  }
+    // host→tenant 매핑 조회 (proxy 가 Redis aegis:routes 에 발행).
+    // 매핑되면 고객사 대시보드(tenant 필터)에도 차단 로그가 보인다.
+    let tenantId = null
+    let companyName = null
+    const host = txn.host ? txn.host.split(':')[0].toLowerCase() : null
+    if (host) {
+      try {
+        const raw = await redisClient.hGet('aegis:routes', host)
+        if (raw) {
+          const m = JSON.parse(raw)
+          tenantId = m.tenant_id || null
+          companyName = m.company_name || null
+        }
+      } catch (err) {
+        console.warn(`[WAFLog] route 조회 실패(${host}): ${err.message}`)
+      }
+    }
 
-  redisClient
-    .lPush(SECURITY_EVENT_QUEUE, JSON.stringify(event))
-    .then(() =>
-      console.log(
-        `[WAFLog] 차단 이벤트 적재: ${event.method} ${event.path} from ${event.ip} (rules=${ids.join(',')})`,
-      ),
+    const eventId = `waf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    const event = {
+      event_id: eventId,
+      trace_id: `trace-${eventId}`,
+      timestamp: new Date().toISOString(),
+      event_type: 'waf_blocked',
+      analysis_profile: 'full',
+      tenant_id: tenantId, // 매핑 실패 시 null → admin 뷰에만 표시
+      company_name: companyName,
+      ip: txn.ip || 'unknown',
+      session_id: 'unknown',
+      method: txn.method || 'GET',
+      host: txn.host || null,
+      path: txn.path || '/',
+      query: txn.query || '',
+      headers: {},
+      body: '',
+      status_code: 403,
+      action_on_match: 'block',
+      waf_rule_hits: ids, // 매칭된 CRS 룰 ID 전체 (참고용)
+    }
+
+    await redisClient.lPush(SECURITY_EVENT_QUEUE, JSON.stringify(event))
+    console.log(
+      `[WAFLog] 차단 이벤트 적재: ${event.method} ${event.path} from ${event.ip} tenant=${tenantId || '(none)'} (rules=${ids.join(',')})`,
     )
-    .catch((err) => console.error('[WAFLog] Redis 적재 실패:', err.message))
+  } catch (err) {
+    console.error('[WAFLog] 차단 이벤트 처리 실패:', err.message)
+  }
 }
 
 // 트랜잭션 종료 시: 라이브 룰 TTL 갱신 + shadow 룰 분류 + 차단 이벤트 적재
