@@ -185,9 +185,19 @@ pause 3
 # 매 시연 고유 IP/패턴 (블랙리스트·클러스터 캐시 충돌 회피)
 DEMO_IP="10.$((RANDOM%250+1)).$((RANDOM%250+1)).$((RANDOM%250+1))"
 EVENT_ID="demo-$(date +%s)"
-info "▸ Redis 큐에 SQLi UNION SELECT 공격 이벤트 적재 (ip=$DEMO_IP)..."
+
+# [고객사 대시보드 시연용] tenant_id 를 넣으면 그 고객사 계정 대시보드에도 로그가 뜬다.
+#   export DEMO_TENANT_ID=<고객사 tenant_id(UUID)>  를 미리 지정하면 됨.
+#   (미지정 시 빈 값 → 관리자(admin) 대시보드에만 표시. customer 필터엔 안 잡힘)
+DEMO_TENANT_ID="${DEMO_TENANT_ID:-}"
+DEMO_COMPANY="${DEMO_COMPANY:-Demo Corp}"
+if [ -n "$DEMO_TENANT_ID" ]; then
+  info "▸ Redis 큐에 SQLi UNION SELECT 공격 이벤트 적재 (ip=$DEMO_IP, tenant=$DEMO_TENANT_ID)..."
+else
+  info "▸ Redis 큐에 SQLi UNION SELECT 공격 이벤트 적재 (ip=$DEMO_IP, tenant 미지정=admin 뷰 전용)..."
+fi
 sudo docker exec aegis-redis redis-cli LPUSH aegis:security-events \
-  "{\"event_id\":\"$EVENT_ID\",\"trace_id\":\"trace-$EVENT_ID\",\"ip\":\"$DEMO_IP\",\"path\":\"/admin/login\",\"method\":\"POST\",\"query\":\"id=1 UNION SELECT password FROM users--\",\"headers\":{\"user-agent\":\"sqlmap/1.5\"},\"body\":\"\",\"analysis_profile\":\"full\",\"action_on_match\":\"block\",\"event_type\":\"blocked_request\",\"status_code\":403}" \
+  "{\"event_id\":\"$EVENT_ID\",\"trace_id\":\"trace-$EVENT_ID\",\"tenant_id\":\"$DEMO_TENANT_ID\",\"company_name\":\"$DEMO_COMPANY\",\"ip\":\"$DEMO_IP\",\"path\":\"/admin/login\",\"method\":\"POST\",\"query\":\"id=1 UNION SELECT password FROM users--\",\"headers\":{\"user-agent\":\"sqlmap/1.5\"},\"body\":\"\",\"analysis_profile\":\"full\",\"action_on_match\":\"block\",\"event_type\":\"blocked_request\",\"status_code\":403}" \
   > /dev/null
 success "이벤트 적재 완료 (event_id=$EVENT_ID)"
 pause 2

@@ -162,6 +162,10 @@ services:
       - MONGO_HOST=mongodb
       - MONGO_PORT=27017
       - MONGO_AUTH_SOURCE=admin
+      # 포털(portal-backend)이 읽는 컬렉션과 반드시 일치해야 함.
+      # 미설정 시 tasks.py 기본값 security_logs 라 포털(traffic_logs)과 어긋나 로그가 안 보임.
+      - MONGO_DB_NAME=aegis_logs
+      - MONGO_COLLECTION_NAME=traffic_logs
       - RISK_ANALYZER_URL=http://detection-engine:5000/analyze
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       # 운영 기본값 80 (CRITICAL 직전). 시연 시에만 demo_setup.sh 가 env 로 30 주입.

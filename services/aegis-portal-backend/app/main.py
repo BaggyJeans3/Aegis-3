@@ -58,7 +58,7 @@ from .customers import (
     get_admin_tenant_summary,
     list_all_tenants_for_admin,
 )
-from .auth import get_current_user, get_auth_context, AuthContext
+from .auth import get_current_user, get_auth_context, get_auth_context_sse, AuthContext
 
 
 @asynccontextmanager
@@ -387,14 +387,14 @@ async def get_tenants(ctx: AuthContext = Depends(get_auth_context)):
 @app.get("/api/logs/stream")
 async def logs_stream(
     tenant_id: Optional[str] = None,
-    ctx: AuthContext = Depends(get_auth_context),
+    ctx: AuthContext = Depends(get_auth_context_sse),
 ):
     """
     SSE 실시간 로그 스트림 (인증 필수).
 
-    주의: 브라우저의 EventSource 는 커스텀 헤더(Authorization)를 못 보냄.
-    프론트에서는 토큰을 쿼리 파라미터로 보내거나(보안 약함),
-    fetch-기반 SSE 라이브러리를 사용해야 함. 지금은 일단 동작 우선.
+    인증: Authorization 헤더 우선, 없으면 쿼리 파라미터 ?token=<JWT> 로 fallback.
+    브라우저 기본 EventSource 는 커스텀 헤더를 못 보내므로 보통 ?token= 을 사용한다.
+    (get_auth_context_sse 가 둘 다 처리)
 
     권한:
       - admin: tenant_id 지정 가능. 미지정 시 전체.
@@ -425,7 +425,13 @@ async def logs_stream(
             resolved_tenant = owned[0]
 
     async def gen():
+        # 연결 직후 한 번 코멘트 전송 → 클라이언트가 '연결됨' 으로 인식
+        yield ": connected\n\n"
         async for log in event_stream(resolved_tenant):
+            # keepalive 센티넬: 데이터 아님. SSE 코멘트로 연결만 유지.
+            if isinstance(log, dict) and log.get("_keepalive"):
+                yield ": keepalive\n\n"
+                continue
             # stream_source 가 raw 데이터를 줄 경우 변환.
             # 이미 변환된 형태면 _to_frontend_schema 가 안전하게 처리.
             converted = _to_frontend_schema(log) if "raw_event" in log else log

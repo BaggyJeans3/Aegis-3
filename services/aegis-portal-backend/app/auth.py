@@ -29,6 +29,7 @@ Supabase JWT 검증 + 권한(role) 판별.
 """
 import os
 import time
+from typing import Optional
 
 import httpx
 import jwt
@@ -69,22 +70,13 @@ def _unauthorized(detail: str) -> HTTPException:
     )
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
-) -> dict:
+def _decode_token(token: str) -> dict:
     """
-    Authorization 헤더의 Bearer 토큰을 검증하고 payload(클레임)를 반환.
-    실패 시 401.
-
-    user["sub"] = Supabase user_id (UUID 문자열)
+    원시 토큰 문자열을 Supabase JWKS 로 검증하고 payload(클레임)를 반환.
+    헤더 기반/쿼리 기반 인증이 공통으로 사용. 실패 시 401.
     """
     if _jwks_client is None:
         raise _unauthorized("Supabase 설정 누락 (SUPABASE_URL)")
-
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        raise _unauthorized("Authorization 헤더 없음 또는 형식 오류")
-
-    token = credentials.credentials
 
     try:
         signing_key = _jwks_client.get_signing_key_from_jwt(token).key
@@ -108,6 +100,21 @@ async def get_current_user(
         raise _unauthorized(f"토큰 처리 오류: {e}")
 
     return payload
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
+) -> dict:
+    """
+    Authorization 헤더의 Bearer 토큰을 검증하고 payload(클레임)를 반환.
+    실패 시 401.
+
+    user["sub"] = Supabase user_id (UUID 문자열)
+    """
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise _unauthorized("Authorization 헤더 없음 또는 형식 오류")
+
+    return _decode_token(credentials.credentials)
 
 
 # ===== 권한(role) 판별 - user_profiles 조회 기반 =====
@@ -191,6 +198,34 @@ async def get_auth_context(
     """
     user_id = payload.get("sub", "")
     role = await get_role_for_user(user_id)
+    return AuthContext(payload, role)
+
+
+async def get_auth_context_sse(
+    token: Optional[str] = None,
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
+) -> AuthContext:
+    """
+    SSE(EventSource) 전용 인증.
+
+    브라우저 기본 EventSource 는 커스텀 헤더(Authorization)를 못 보내므로,
+    Authorization 헤더가 없으면 쿼리 파라미터 ?token=<JWT> 로 fallback 한다.
+    헤더가 있으면 헤더 우선.
+
+    [보안 주의] 토큰을 URL 쿼리로 보내면 nginx access log 등에 남을 수 있다.
+    가능하면 fetch 기반 SSE 로 헤더 전송을 권장. (운영 동작 우선이라 둘 다 허용)
+    """
+    raw_token: Optional[str] = None
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        raw_token = credentials.credentials
+    elif token:
+        raw_token = token
+
+    if not raw_token:
+        raise _unauthorized("토큰 없음 (Authorization 헤더 또는 ?token= 쿼리 필요)")
+
+    payload = _decode_token(raw_token)
+    role = await get_role_for_user(payload.get("sub", ""))
     return AuthContext(payload, role)
 
 
