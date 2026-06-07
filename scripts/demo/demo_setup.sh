@@ -2,24 +2,53 @@
 # ============================================================
 # Aegis-3 시연 환경 사전 준비 스크립트
 # 사용법: ./demo_setup.sh
+#
+# [중요] 운영 안전값 위에서 시연용 튜닝을 "런타임으로만" 적용한다.
+#   - 커밋된 설정(main)은 운영 안전값 유지 (AI threshold 80, Coraza 풀룰, rate limit on)
+#   - 이 스크립트가 시연 동안만 약화: AI threshold 30 + Coraza 930130/130010 제거
+#   - 시연 후 demo_restore.sh 가 git checkout 으로 전부 원복
 # ============================================================
+
+# 리포지토리 루트 (이 스크립트는 scripts/demo/ 안에 있음)
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+COMPOSE="-f $REPO_ROOT/docker-compose.yml -f $REPO_ROOT/docker-compose.prod.yml"
 
 echo "════════════════════════════════════════"
 echo "  Aegis-3 시연 환경 준비 시작"
 echo "════════════════════════════════════════"
+echo "  리포지토리: $REPO_ROOT"
 echo ""
 
-# 1. SHADOW_DURATION 짧게 설정 (시연용)
-echo "▸ 1. 시연용 환경변수 적용 안내"
-echo "  → docker-compose.yml의 nginx 서비스에 추가 권장:"
-echo "    environment:"
-echo "      SHADOW_DURATION: 30        # 5분 → 30초"
-echo "      TTL_SECONDS: 60             # 24h → 60초"
-echo "      MIN_SHADOW_SAMPLES: 1"
+# 1. 시연용 런타임 튜닝 적용 (운영 안전값 → 시연값, 임시)
+echo "▸ 1. 시연용 런타임 튜닝 적용"
+
+# 1-a. AI 룰 생성 임계값 80 → 30 (시연 이벤트는 40점이라 80이면 룰이 안 생김)
+echo "  ▹ soar-worker AI_RULE_THRESHOLD=30 으로 재기동..."
+( cd "$REPO_ROOT" && sudo env AI_RULE_THRESHOLD=30 docker compose $COMPOSE up -d --force-recreate --no-deps soar-worker ) \
+  && echo "    ✓ soar-worker 재기동 (threshold=30)" \
+  || echo "    ⚠ soar-worker 재기동 실패"
+
+# 1-b. Coraza 민감파일 차단룰(930130/130010) 임시 제거 → /.env 허니팟 유인 동작
+CORAZA_HOST="$REPO_ROOT/nginx/coraza.conf"
+if ! grep -q "SecRuleRemoveById 930130" "$CORAZA_HOST" 2>/dev/null; then
+  cat >> "$CORAZA_HOST" <<'EOF'
+
+# [시연 임시 - demo_setup.sh 자동 추가] 허니팟 유인: 민감파일 접근을 허니팟으로.
+# demo_restore.sh 의 git checkout 으로 원복됨. 커밋하지 말 것.
+SecRuleRemoveById 930130
+SecRuleRemoveById 130010
+EOF
+  echo "  ▹ Coraza 930130/130010 임시 제거 (허니팟 유인용)"
+else
+  echo "  ▹ Coraza 임시 제거 룰 이미 적용됨 (무시)"
+fi
+sudo docker exec aegis-nginx nginx -s reload 2>/dev/null \
+  && echo "    ✓ nginx reload 완료" \
+  || echo "    ⚠ nginx reload 실패 (nginx 미기동?)"
+
 echo ""
-echo "  → 적용 후: docker compose up -d --force-recreate nginx"
-echo ""
-echo "  (이미 적용된 경우 무시)"
+echo "  (참고: nginx 의 SHADOW_DURATION/TTL_SECONDS 시연값은 docker-compose.yml 의"
+echo "   nginx 서비스 environment 에 이미 반영되어 있음)"
 echo ""
 sleep 3
 

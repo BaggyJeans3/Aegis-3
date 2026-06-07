@@ -164,7 +164,8 @@ services:
       - MONGO_AUTH_SOURCE=admin
       - RISK_ANALYZER_URL=http://detection-engine:5000/analyze
       - GEMINI_API_KEY=${GEMINI_API_KEY}
-      - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-30}
+      # 운영 기본값 80 (CRITICAL 직전). 시연 시에만 demo_setup.sh 가 env 로 30 주입.
+      - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
       - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
     depends_on:
       - redis
