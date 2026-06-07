@@ -72,9 +72,14 @@ jobs:
             sudo apt-get clean
             sudo journalctl --vacuum-size=50M
 
-            # 도커 정리 (용량 부족 방지)
-            sudo docker system prune -af
-            sudo docker builder prune -af
+            # 도커 정리 (용량 확보).
+            # [중요] base 이미지(mongo/postgres/redis/python)는 보존한다.
+            # 예전엔 `system prune -af` 로 모든 이미지를 지웠는데, 그러면 매 배포마다
+            # base 이미지를 재pull → Docker Hub 익명 pull rate limit 에 막혀 배포가 실패한다.
+            # 용량 주범인 '빌드 캐시'와 'dangling(태그 없는) 레이어'만 정리하면 충분하다.
+            sudo docker container prune -f
+            sudo docker image prune -f       # dangling 만 — 태그된 base 이미지는 보존
+            sudo docker builder prune -af    # 빌드 캐시 (용량 최대 절감)
 
             # 도커 실행 (EC2 운영용 override 포함: nginx 를 host 80 에 게시 → Cloudflare 프록시 연결)
             sudo docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
