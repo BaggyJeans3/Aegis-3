@@ -34,6 +34,8 @@ jobs:
             cd /home/ubuntu/Aegis-3
 
             git fetch origin
+            # main 브랜치로 강제 전환 (이름표까지 main 으로 맞춤)
+            git checkout -B main origin/main
             git reset --hard origin/main
 
             # env 생성
