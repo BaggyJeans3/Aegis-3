@@ -45,6 +45,12 @@ NGINX_SIDECAR_URL = os.getenv(
     "http://nginx:4000/api/v1/rules/inject"
 )
 
+# analyzer(통합 대응 엔진) 보고 엔드포인트 — 고위험 시 CF 차단 + Slack + Email 트리거
+ANALYZER_REPORT_URL = os.getenv(
+    "ANALYZER_REPORT_URL",
+    "http://analyzer:5000/api/v1/report"
+)
+
 
 # ============================================================
 # [Aegis-3 SOAR] 작업 7 — 공격 클러스터링
@@ -303,6 +309,23 @@ def _inject_rule_to_nginx(rule: dict) -> None:
         print(f"[Error] Nginx 사이드카 룰 주입 실패: {inj_err}")
 
 
+def _report_to_analyzer(ip: str, attack_type: str) -> None:
+    """
+    고위험 이벤트를 analyzer(/api/v1/report)로 보고.
+    analyzer 가 Cloudflare 차단 + Slack 알림 + Email 보고를 수행한다.
+    실패해도 본 파이프라인(저장/룰생성)에는 영향 없도록 예외를 삼킨다.
+    """
+    try:
+        resp = requests.post(
+            ANALYZER_REPORT_URL,
+            json={"ip": ip, "type": attack_type},
+            timeout=5,
+        )
+        print(f"[Worker] analyzer 보고 응답: {resp.status_code} - {resp.text[:200]}")
+    except Exception as rep_err:
+        print(f"[Error] analyzer 보고 실패(무시): {rep_err}")
+
+
 @celery_app.task(bind=True, max_retries=3)
 def process_security_log(self, log_data):
     """
@@ -368,6 +391,16 @@ def process_security_log(self, log_data):
             # ──────────────────────────────────────────────────────────
             ip = raw_event.get("ip")
             blacklist_key = f"aegis:blacklist:{ip}" if ip and ip != "unknown" else None
+
+            # ── analyzer 통합 대응(CF 차단/Slack/Email) 트리거 ──
+            # blacklist/cluster 캐시로 LLM 을 스킵하더라도 알림은 보내도록,
+            # 조기 return 들보다 먼저 이 위치에서 보고한다.
+            _alert_level = detection_result.get("level") or "HIGH"
+            _alert_hits = detection_result.get("rule_hits") or []
+            _attack_type = f"{_alert_level} (risk {risk_score})"
+            if _alert_hits:
+                _attack_type += " / " + ", ".join(str(h) for h in _alert_hits)
+            _report_to_analyzer(ip or "unknown", _attack_type)
 
             if blacklist_key:
                 try:
