@@ -92,3 +92,27 @@ jobs:
             sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS supabase_user_id UUID;"
             sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS spec_text TEXT;"
             sudo docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "CREATE INDEX IF NOT EXISTS idx_tenants_supabase_user ON tenants(supabase_user_id);"
+
+            # MongoDB 로그 컬렉션 정합 (worker=portal 둘 다 traffic_logs 사용).
+            # 과거 worker 가 security_logs 에 쌓아둔 실데이터를 traffic_logs 로 1회 이관.
+            # idempotent: security_logs 가 없으면 그냥 skip → 매 배포 재실행해도 안전.
+            # (traffic_logs 는 절대 drop 하지 않음)
+            echo "MongoDB 컨테이너 준비 대기..."
+            for i in $(seq 1 30); do
+              if sudo docker exec aegis-mongodb mongosh -u aegis_user -p "${{ secrets.MONGO_PASSWORD }}" --authenticationDatabase admin --quiet --eval 'db.runCommand({ping:1})' >/dev/null 2>&1; then
+                break
+              fi
+              sleep 2
+            done
+
+            sudo docker exec aegis-mongodb mongosh -u aegis_user -p "${{ secrets.MONGO_PASSWORD }}" --authenticationDatabase admin aegis_logs --quiet --eval '
+              const names = db.getCollectionNames();
+              if (names.indexOf("security_logs") !== -1) {
+                let n = 0;
+                db.security_logs.find().forEach(function (d) { try { db.traffic_logs.insertOne(d); n++; } catch (e) {} });
+                db.security_logs.drop();
+                print("[migrate] security_logs -> traffic_logs: " + n + " docs 이관 후 security_logs drop");
+              } else {
+                print("[migrate] security_logs 없음 — 이관 skip (정상)");
+              }
+            '
