@@ -40,6 +40,18 @@ const RELOAD_DEBOUNCE_MS = parseInt(process.env.RELOAD_DEBOUNCE_MS || '2000', 10
 const AI_RULE_ID_MIN = 2000000000
 const AI_RULE_ID_MAX = 2099999999
 
+// ── [차단 로그 적재] Coraza 가 차단(deny)한 요청을 MongoDB 로 보내기 위한 설정 ──
+// 차단 판정 신호: CRS 익명점수 차단룰(949110 inbound / 959100 outbound)이 매칭됐다 =
+// 익명점수 임계 초과로 요청이 deny 됐다는 의미. 이 룰이 보이면 '차단된 공격'으로 본다.
+// proxy 가 못 보는(엣지에서 끊긴) SQLi/XSS 등을 여기서 잡아 worker→Mongo 로 흘려보낸다.
+const BLOCK_SIGNAL_RULE_IDS = (process.env.BLOCK_SIGNAL_RULE_IDS || '949110,959100')
+  .split(',')
+  .map((s) => parseInt(s.trim(), 10))
+  .filter((n) => !isNaN(n))
+// proxy/worker 와 동일한 큐. worker(consume_logs_from_redis_queue)가 RPOP 해서 저장한다.
+const SECURITY_EVENT_QUEUE =
+  process.env.SECURITY_EVENT_QUEUE || 'aegis:security-events'
+
 // Shadow 판정 B(IP 평판)용 Redis. 연결 실패해도 핵심기능은 계속(fail-open: B 생략=C만).
 const REDIS_HOST = process.env.REDIS_HOST || 'redis'
 const REDIS_PORT = parseInt(process.env.REDIS_PORT || '6379', 10)
@@ -383,7 +395,52 @@ async function classifyShadowMatch(ruleId, crsCorroborated, ip) {
   }
 }
 
-// 트랜잭션 종료 시: 라이브 룰 TTL 갱신 + shadow 룰 분류
+// Coraza 가 차단한 트랜잭션을 Redis 큐로 적재 → worker 가 MongoDB(traffic_logs)에 저장.
+// proxy 를 거치지 않고 엣지에서 끊긴 SQLi/XSS 등이 대시보드에 보이게 하는 경로.
+function maybePushBlockedEvent(txn, ids) {
+  // 차단 신호룰(949110 등)이 매칭됐을 때만 = 실제 deny 된 요청
+  const blocked = ids.some((id) => BLOCK_SIGNAL_RULE_IDS.includes(id))
+  if (!blocked) return
+  if (!redisReady) {
+    console.warn('[WAFLog] Redis 미연결 — 차단 이벤트 적재 skip')
+    return
+  }
+
+  const eventId = `waf-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+  const event = {
+    event_id: eventId,
+    trace_id: `trace-${eventId}`,
+    timestamp: new Date().toISOString(),
+    event_type: 'waf_blocked',
+    analysis_profile: 'full',
+    // host→tenant_id(UUID) 매핑은 사이드카에 DB 가 없어 생략(null).
+    // 현재는 admin 대시보드(필터 없음)에 표시됨. 고객사 뷰 표시는 후속 과제.
+    tenant_id: null,
+    company_name: null,
+    ip: txn.ip || 'unknown',
+    session_id: 'unknown',
+    method: txn.method || 'GET',
+    host: txn.host || null,
+    path: txn.path || '/',
+    query: txn.query || '',
+    headers: {},
+    body: '',
+    status_code: 403,
+    action_on_match: 'block',
+    waf_rule_hits: ids, // 매칭된 CRS 룰 ID 전체 (참고용)
+  }
+
+  redisClient
+    .lPush(SECURITY_EVENT_QUEUE, JSON.stringify(event))
+    .then(() =>
+      console.log(
+        `[WAFLog] 차단 이벤트 적재: ${event.method} ${event.path} from ${event.ip} (rules=${ids.join(',')})`,
+      ),
+    )
+    .catch((err) => console.error('[WAFLog] Redis 적재 실패:', err.message))
+}
+
+// 트랜잭션 종료 시: 라이브 룰 TTL 갱신 + shadow 룰 분류 + 차단 이벤트 적재
 function finalizeTransaction(txn) {
   const ids = [...txn.ruleIds]
   if (ids.length === 0) return
@@ -402,6 +459,9 @@ function finalizeTransaction(txn) {
       classifyShadowMatch(id, crsCorroborated, txn.ip)
     }
   }
+
+  // Coraza 차단 요청을 MongoDB 파이프라인으로 흘려보냄
+  maybePushBlockedEvent(txn, ids)
 }
 
 function startLogWatcher() {
@@ -415,6 +475,8 @@ function startLogWatcher() {
 
   let txn = null // 현재 누적 중인 트랜잭션
   let captureIp = false // A 파트 IP가 다음 줄에 있는 포맷 대비
+  let partB = false // 현재 B(요청 헤더) 파트 안인지
+  let expectReqLine = false // B 파트 첫 줄(요청라인) 대기
 
   tail.on('line', (line) => {
     const b = line.match(BOUNDARY_RE)
@@ -424,14 +486,20 @@ function startLogWatcher() {
         // Coraza native 는 IP 헤더가 보통 '다음 줄'(--id-A-- 단독 줄)이지만,
         // 일부 ModSecurity 호환 출력은 같은 줄에 둔다 → 둘 다 처리.
         const ip = parseClientIpFromAHeader(line)
-        txn = { ip, ruleIds: new Set() }
+        txn = { ip, ruleIds: new Set(), method: null, path: null, query: '', host: null }
         captureIp = ip === null // 같은 줄에 없으면 다음 줄에서 캡처
+        partB = false
+        expectReqLine = false
       } else if (part === 'Z') {
         if (txn) finalizeTransaction(txn)
         txn = null
         captureIp = false
+        partB = false
+        expectReqLine = false
       } else {
-        captureIp = false // 다른 파트(B,H 등) 경계 → A 헤더 구간 종료
+        captureIp = false // 다른 파트 경계 → A 헤더 구간 종료
+        partB = part === 'B' // B 파트(요청 헤더) 진입 여부
+        expectReqLine = part === 'B' // B 첫 줄 = 요청라인
       }
       return // 경계 라인 자체엔 룰 ID 없음
     }
@@ -450,6 +518,24 @@ function startLogWatcher() {
       txn.ip = parseClientIpFromAHeader(line)
       captureIp = false
     }
+
+    // B(요청) 파트: 요청라인(METHOD URI HTTP/x)과 Host 헤더 캡처 → 차단 로그용
+    if (partB) {
+      if (expectReqLine && line.trim()) {
+        const rl = line.trim().match(/^([A-Z]+)\s+(\S+)\s+HTTP\//)
+        if (rl) {
+          txn.method = rl[1]
+          const uri = rl[2]
+          const qi = uri.indexOf('?')
+          txn.path = qi >= 0 ? uri.slice(0, qi) : uri
+          txn.query = qi >= 0 ? uri.slice(qi + 1) : ''
+        }
+        expectReqLine = false
+      } else if (/^Host:\s*/i.test(line)) {
+        txn.host = line.replace(/^Host:\s*/i, '').trim()
+      }
+    }
+
     // 이 트랜잭션에서 매칭된 모든 룰 ID 누적 (주로 H 파트)
     for (const m of line.matchAll(/\[id "(\d+)"\]/g)) {
       txn.ruleIds.add(parseInt(m[1], 10))
