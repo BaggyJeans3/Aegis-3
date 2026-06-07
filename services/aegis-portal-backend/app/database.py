@@ -3,6 +3,10 @@ MongoDB 연결 관리.
 접속 정보는 환경변수로 주입받음.
   - PC에서 실행: 같은 폴더의 .env 파일에서 자동 로드
   - EC2 docker-compose에서 실행: compose의 environment로 주입
+
+[변경 사항]
+  - 컬렉션: traffic_logs (soar 시스템이 직접 INSERT)
+  - 인덱스: 새 스키마 (raw_event.tenant_id, raw_event.timestamp 등) 기준
 """
 import os
 from urllib.parse import quote_plus
@@ -33,6 +37,7 @@ MONGO_URI = (
     f"@{MONGO_HOST}:{MONGO_PORT}/?authSource=admin"
 )
 
+# soar 시스템이 INSERT 하는 컬렉션 이름
 LOG_COLLECTION = "traffic_logs"
 
 
@@ -50,12 +55,14 @@ def get_collection():
 
 async def connect_to_mongo():
     db.client = AsyncIOMotorClient(MONGO_URI)
-    # 자주 쓰는 조회 필드에 인덱스 생성 (없으면 만들고 있으면 무시)
+    # 새 soar 스키마 기준 인덱스 생성 (없으면 만들고 있으면 무시)
     coll = get_collection()
-    await coll.create_index("subject.tenant_id")
-    await coll.create_index("event.timestamp")
-    await coll.create_index("security_analysis.action")
+    await coll.create_index("raw_event.tenant_id")
+    await coll.create_index("raw_event.timestamp")
+    await coll.create_index("created_at")
+    await coll.create_index("security_analysis.action_on_match")
     await coll.create_index("security_analysis.risk_score")
+    await coll.create_index("security_analysis.level")
 
 
 async def close_mongo_connection():

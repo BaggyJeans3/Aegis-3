@@ -10,6 +10,8 @@ Aegis 포털 백엔드 (FastAPI).
   GET  /api/stats           통계 (admin=전체 / customer=본인 tenant)
   GET  /api/tenants         테넌트 드롭다운 목록 (admin/customer 분기)
   GET  /api/logs/stream     SSE 실시간 (admin/customer 분기)
+  GET  /api/admin/tenants/summary  관리자 카드용 요약
+  GET  /api/admin/tenants          관리자 전체 고객사 목록
 
 권한 정책:
   - 모든 /api/* (health/seed 제외)는 JWT 인증 필수
@@ -17,15 +19,21 @@ Aegis 포털 백엔드 (FastAPI).
   - customer (그 외)                          -> 본인 소유 tenant_id 로만 필터
 
 데이터 저장소:
-  MongoDB    - 트래픽 로그 (database.py)
+  MongoDB    - 트래픽 로그 (database.py, traffic_logs 컬렉션)
   PostgreSQL - 고객사/라우팅 정보 (postgres.py)
 
 ================================================================
-길1 -> 길2 전환 가이드 (나중에 EC2 SOAR 파이프라인이 완성되면)
+[중요] 스키마 변경
 ----------------------------------------------------------------
-  1. seed_data.py 파일 삭제
-  2. 아래 @app.post("/api/seed") 블록 삭제
-  3. stream_source.py 의 dummy_stream() -> change_stream() 으로 교체
+soar 시스템이 traffic_logs 에 INSERT 하는 실제 스키마는 평평한 구조:
+  raw_event.{tenant_id, ip, method, path, status_code, timestamp, ...}
+  security_analysis.{risk_score, level, action_on_match, rule_hits, ...}
+
+본인 프론트는 옛 더미용 중첩 스키마를 기대:
+  subject.tenant_id, source.nat_ip, http.request.method, ...
+
+해결: 백엔드가 응답 시점에 평평한 스키마 -> 중첩 스키마로 변환.
+프론트 코드 변경 없음.
 ================================================================
 """
 import asyncio
@@ -63,27 +71,101 @@ async def lifespan(app: FastAPI):
     await close_mongo_connection()
 
 
-app = FastAPI(title="Aegis Portal Backend", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="Aegis Portal Backend", version="0.4.0", lifespan=lifespan)
 
-# Vite 프론트(개발 서버)에서 호출 가능하도록 CORS 허용.
-# 운영 시에는 allow_origins를 실제 프론트 도메인으로 좁힐 것.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "https://dashboard.aegis3.cloud",
+        "https://aegis-3.baggyjeans2026.workers.dev",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-def _serialize(doc: dict) -> dict:
-    """MongoDB 문서를 JSON 직렬화 가능하게 변환."""
+def _to_frontend_schema(doc: dict) -> dict:
+    """
+    soar 의 평평한 스키마 -> 프론트가 기대하는 중첩 스키마로 변환.
+
+    soar (실제 MongoDB):
+        {
+          _id, event_id, trace_id,
+          raw_event: { tenant_id, ip, method, path, status_code, timestamp, ... },
+          security_analysis: { risk_score, level, action_on_match, rule_hits, ... },
+          created_at
+        }
+
+    프론트 (기존):
+        {
+          _id,
+          event: { id, timestamp },
+          subject: { tenant_id, user: { id } },
+          source: { nat_ip },
+          http: { request: { method, path }, response: { status_code } },
+          security_analysis: { risk_score, action, rule_id, flags: {...} }
+        }
+    """
     if doc is None:
         return doc
-    doc["_id"] = str(doc["_id"])
-    ts = doc.get("event", {}).get("timestamp")
-    if isinstance(ts, datetime):
-        doc["event"]["timestamp"] = ts.isoformat()
-    return doc
+
+    raw = doc.get("raw_event") or {}
+    sec = doc.get("security_analysis") or {}
+
+    # rule_hits 리스트의 첫 번째 항목을 rule_id 로 매핑 (없으면 None)
+    rule_hits = sec.get("rule_hits") or []
+    rule_id = rule_hits[0] if rule_hits else None
+
+    # soar 의 risk_score 는 0-100 정수. 프론트는 0-1 실수 기대.
+    raw_score = sec.get("risk_score", 0)
+    try:
+        normalized_score = float(raw_score) / 100.0
+    except (TypeError, ValueError):
+        normalized_score = 0.0
+
+    return {
+        "_id": str(doc.get("_id", "")),
+        "event": {
+            "id": doc.get("event_id"),
+            "timestamp": raw.get("timestamp") or doc.get("created_at"),
+        },
+        "subject": {
+            "tenant_id": raw.get("tenant_id"),
+            "user": {
+                # soar 에 user.id 가 없으므로 session_id 일부를 사용
+                "id": (raw.get("session_id") or "unknown")[:32],
+            },
+        },
+        "source": {
+            "nat_ip": raw.get("ip"),
+        },
+        "http": {
+            "request": {
+                "method": raw.get("method") or "GET",
+                "path": raw.get("path") or "/",
+            },
+            "response": {
+                "status_code": int(raw.get("status_code") or 0),
+            },
+        },
+        "security_analysis": {
+            "risk_score": normalized_score,
+            "action": sec.get("action_on_match") or "unknown",
+            "rule_id": rule_id,
+            # soar 스키마엔 개별 플래그 없음. 기본 False.
+            "flags": {
+                "is_bola": False,
+                "is_shadow_api": False,
+                "is_data_leak": False,
+            },
+        },
+        # 부수 정보 (프론트에서 안 써도 됨)
+        "company_name": raw.get("company_name"),
+        "level": sec.get("level"),
+        "alert": sec.get("alert", False),
+    }
 
 
 async def _resolve_tenant_filter(
@@ -100,17 +182,19 @@ async def _resolve_tenant_filter(
       - admin + tenant_id 지정 -> 그 tenant 만
       - admin + 미지정         -> 전체 (필터 없음)
       - customer               -> 본인 소유 tenant_id 들 (요청값은 본인 소유에 한해서만 적용)
+
+    [중요] 필터 필드명은 새 스키마 기준: raw_event.tenant_id
     """
     if ctx.is_admin:
         if requested_tenant_id:
-            return {"subject.tenant_id": requested_tenant_id}
+            return {"raw_event.tenant_id": requested_tenant_id}
         return None  # 전체
 
     # customer: 본인 소유 tenant 만
     owned = await list_owned_tenant_ids(ctx.user_id)
     if not owned:
         # 등록한 고객사가 없으면 어떤 로그도 못 봄
-        return {"subject.tenant_id": {"$in": []}}  # 0개 매칭
+        return {"raw_event.tenant_id": {"$in": []}}  # 0개 매칭
 
     if requested_tenant_id:
         # 요청한 tenant 가 본인 소유인지 확인
@@ -119,10 +203,10 @@ async def _resolve_tenant_filter(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="해당 tenant 에 접근 권한이 없습니다.",
             )
-        return {"subject.tenant_id": requested_tenant_id}
+        return {"raw_event.tenant_id": requested_tenant_id}
 
     # tenant 지정 안 했으면 본인 소유 전체
-    return {"subject.tenant_id": {"$in": owned}}
+    return {"raw_event.tenant_id": {"$in": owned}}
 
 
 @app.get("/api/health")
@@ -140,6 +224,9 @@ async def seed(
     """
     더미 로그를 MongoDB에 채움. 기존 데이터는 비우고 새로 삽입.
     admin 만 허용 (테스트 데이터 조작 권한).
+
+    [주의] 길2 (soar 실제 데이터) 전환 후엔 이 엔드포인트가 의미 없음.
+    호출하지 말 것. 실제 soar 데이터가 지워질 수 있음.
     """
     if not ctx.is_admin:
         raise HTTPException(
@@ -157,9 +244,9 @@ async def seed(
 @app.get("/api/logs")
 async def get_logs(
     tenant_id: Optional[str] = None,
-    action: Optional[str] = Query(None, description="allowed/blocked/monitored"),
+    action: Optional[str] = Query(None, description="proxy/block/honeypot/log_only"),
     min_risk: float = Query(0.0, ge=0.0, le=1.0),
-    is_bola: Optional[bool] = None,
+    is_bola: Optional[bool] = None,  # soar 스키마엔 없음 - 무시
     search: Optional[str] = Query(None, description="path 부분 일치 검색"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -170,6 +257,12 @@ async def get_logs(
       - admin: 모든 로그. tenant_id 주면 그 고객사 한정.
       - customer: 본인 소유 tenant_id 로 자동 필터링.
         본인 소유 아닌 tenant_id 를 명시하면 403.
+
+    [중요] 쿼리 필드 새 스키마 기준:
+      raw_event.tenant_id, raw_event.path
+      security_analysis.action_on_match, security_analysis.risk_score
+
+    프론트엔 _to_frontend_schema 로 변환해서 반환.
     """
     coll = get_collection()
 
@@ -180,26 +273,31 @@ async def get_logs(
     if tenant_filter:
         query.update(tenant_filter)
 
-    # 그 외 일반 필터
+    # 그 외 일반 필터 (새 스키마 기준)
     if action:
-        query["security_analysis.action"] = action
+        query["security_analysis.action_on_match"] = action
+
+    # min_risk 는 프론트에서 0-1 로 받지만 soar 는 0-100 으로 저장.
+    # 변환해서 쿼리.
     if min_risk > 0.0:
-        query["security_analysis.risk_score"] = {"$gte": min_risk}
-    if is_bola is not None:
-        query["security_analysis.flags.is_bola"] = is_bola
+        query["security_analysis.risk_score"] = {"$gte": min_risk * 100}
+
+    # is_bola 는 soar 스키마에 없으므로 무시. (필요 시 reasons 안에 있을 수도)
+
     if search:
-        query["http.request.path"] = {"$regex": search, "$options": "i"}
+        query["raw_event.path"] = {"$regex": search, "$options": "i"}
 
     total = await coll.count_documents(query)
     skip = (page - 1) * page_size
 
+    # 정렬: 새 스키마의 created_at 기준 (또는 raw_event.timestamp)
     cursor = (
         coll.find(query)
-        .sort("event.timestamp", -1)
+        .sort("created_at", -1)
         .skip(skip)
         .limit(page_size)
     )
-    docs = [_serialize(d) async for d in cursor]
+    docs = [_to_frontend_schema(d) async for d in cursor]
 
     return {
         "total": total,
@@ -219,6 +317,8 @@ async def get_stats(
     대시보드 통계 (인증 필수).
       - admin: 전체 통계. tenant_id 주면 그 고객사만.
       - customer: 본인 소유 tenant 로 자동 필터링.
+
+    [중요] 새 스키마 기준 집계.
     """
     coll = get_collection()
     match: dict = {}
@@ -229,33 +329,29 @@ async def get_stats(
 
     base = [{"$match": match}] if match else []
 
+    # 액션별 카운트 (proxy / block / honeypot / log_only)
     by_action = {
         d["_id"]: d["count"]
         async for d in coll.aggregate(base + [
-            {"$group": {"_id": "$security_analysis.action",
+            {"$group": {"_id": "$security_analysis.action_on_match",
                         "count": {"$sum": 1}}},
         ])
     }
 
-    by_country = [
-        {"country": d["_id"], "count": d["count"]}
-        async for d in coll.aggregate(base + [
-            {"$group": {"_id": "$source.geo.country_iso",
-                        "count": {"$sum": 1}}},
-            {"$sort": {"count": -1}},
-            {"$limit": 10},
-        ])
-    ]
+    # 국가별 정보는 soar 스키마에 없음. 빈 배열 반환.
+    by_country: list = []
 
-    flag_counts = {}
-    for flag in ["is_bola", "is_shadow_api", "is_data_leak"]:
-        flag_counts[flag] = await coll.count_documents(
-            {**match, f"security_analysis.flags.{flag}": True}
-        )
+    # 위협 플래그는 soar 스키마에 없음. 대신 level 기반 카운트로 대체.
+    flag_counts = {
+        "is_bola": 0,
+        "is_shadow_api": 0,
+        "is_data_leak": 0,
+    }
 
     total = await coll.count_documents(match)
+    # high_risk: soar 스키마에선 risk_score 가 0-100. 80 이상.
     high_risk = await coll.count_documents(
-        {**match, "security_analysis.risk_score": {"$gte": 0.8}}
+        {**match, "security_analysis.risk_score": {"$gte": 80}}
     )
 
     return {
@@ -274,11 +370,15 @@ async def get_tenants(ctx: AuthContext = Depends(get_auth_context)):
     드롭다운용 tenant 목록 (인증 필수).
       - admin: MongoDB 로그에 등장하는 모든 tenant_id
       - customer: 본인이 소유한 tenant_id 만 (로그 유무 무관)
+
+    [중요] distinct 필드 새 스키마 기준: raw_event.tenant_id
     """
     if ctx.is_admin:
         coll = get_collection()
-        tenants = await coll.distinct("subject.tenant_id")
-        return {"tenants": sorted(tenants)}
+        tenants = await coll.distinct("raw_event.tenant_id")
+        # None 값 제거 후 정렬
+        tenants = sorted([t for t in tenants if t])
+        return {"tenants": tenants}
     # customer: PostgreSQL에서 본인 소유 가져옴
     owned = await list_owned_tenant_ids(ctx.user_id)
     return {"tenants": sorted(owned)}
@@ -299,6 +399,8 @@ async def logs_stream(
     권한:
       - admin: tenant_id 지정 가능. 미지정 시 전체.
       - customer: 본인 소유 외 tenant_id 는 403.
+
+    [중요] stream_source 도 새 스키마로 변환해서 반환해야 프론트가 정상 표시.
     """
     # 권한 사전 검증 (stream 시작 후엔 에러 응답이 어려움)
     resolved_tenant: Optional[str] = None
@@ -320,12 +422,14 @@ async def logs_stream(
             resolved_tenant = tenant_id
         else:
             # tenant 지정 안 했으면 첫 번째 소유 tenant 로 스트림
-            # (여러 tenant 동시 스트리밍은 현재 stream_source 인터페이스 한 개 인자만 지원)
             resolved_tenant = owned[0]
 
     async def gen():
         async for log in event_stream(resolved_tenant):
-            yield f"data: {json.dumps(log, default=str)}\n\n"
+            # stream_source 가 raw 데이터를 줄 경우 변환.
+            # 이미 변환된 형태면 _to_frontend_schema 가 안전하게 처리.
+            converted = _to_frontend_schema(log) if "raw_event" in log else log
+            yield f"data: {json.dumps(converted, default=str)}\n\n"
             await asyncio.sleep(0)
 
     return StreamingResponse(
@@ -396,6 +500,7 @@ async def get_customers(user: dict = Depends(get_current_user)):
     customers = await list_customers(supabase_user_id)
     return {"customers": customers}
 
+
 @app.get("/api/admin/tenants/summary")
 async def admin_tenants_summary(
     ctx: AuthContext = Depends(get_auth_context),
@@ -412,8 +517,8 @@ async def admin_tenants_summary(
             detail="관리자 전용 엔드포인트입니다.",
         )
     return await get_admin_tenant_summary()
- 
- 
+
+
 @app.get("/api/admin/tenants")
 async def admin_all_tenants(
     ctx: AuthContext = Depends(get_auth_context),
@@ -430,4 +535,3 @@ async def admin_all_tenants(
         )
     tenants = await list_all_tenants_for_admin()
     return {"tenants": tenants, "total": len(tenants)}
- 
