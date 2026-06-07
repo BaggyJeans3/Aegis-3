@@ -35,7 +35,6 @@ async def create_customer(
     pool = get_pool()
     api_key = _generate_api_key()
 
-    # supabase_user_id 가 유효한 UUID 인지 확인 (아니면 None 으로)
     try:
         su_id = uuid.UUID(supabase_user_id)
     except (ValueError, AttributeError, TypeError):
@@ -43,7 +42,6 @@ async def create_customer(
 
     async with pool.acquire() as conn:
         async with conn.transaction():
-            # 1. tenants 삽입
             tenant_row = await conn.fetchrow(
                 """
                 INSERT INTO tenants
@@ -55,8 +53,6 @@ async def create_customer(
                 company_name, api_key, plan_type, su_id, spec_text,
             )
 
-            # 2. routers 삽입 (보호 도메인 라우팅 규칙)
-            #    target_origin 이 비어있으면 NULL 로 (허니팟/차단 대비)
             await conn.execute(
                 """
                 INSERT INTO routers
@@ -80,10 +76,7 @@ async def create_customer(
 
 
 async def list_customers(supabase_user_id: str) -> list:
-    """
-    특정 Supabase 회원이 소유한 고객사 목록 조회.
-    supabase_user_id 가 없으면 빈 목록.
-    """
+    """특정 Supabase 회원이 소유한 고객사 목록 조회."""
     try:
         su_id = uuid.UUID(supabase_user_id)
     except (ValueError, AttributeError, TypeError):
@@ -115,10 +108,7 @@ async def list_customers(supabase_user_id: str) -> list:
 
 
 async def list_owned_tenant_ids(supabase_user_id: str) -> list[str]:
-    """
-    특정 회원이 소유한 tenant_id 문자열 목록만 반환.
-    멀티 테넌트 로그 필터링에 사용 (일반 사용자가 자기 로그만 보게).
-    """
+    """특정 회원이 소유한 tenant_id 문자열 목록만 반환."""
     try:
         su_id = uuid.UUID(supabase_user_id)
     except (ValueError, AttributeError, TypeError):
@@ -133,20 +123,50 @@ async def list_owned_tenant_ids(supabase_user_id: str) -> list[str]:
 
 
 # ============================================================
+# [추가] customer 가 보는 로그 필터링용 - inbound_domain 도 함께
+# ============================================================
+
+async def list_owned_domains(supabase_user_id: str) -> list[str]:
+    """
+    특정 회원이 소유한 모든 inbound_domain 목록 반환.
+
+    이유:
+      Coraza WAF 가 차단한 트래픽은 sidecar 가 INSERT 하는데,
+      tenant_id 매핑을 못 해서 null 로 저장됨.
+      대신 raw_event.host 필드에 'test.aegis3.cloud' 같은 도메인이 박힘.
+
+      본인 customer 가 본인 고객사 차단 로그도 보려면 -
+      tenant_id 매칭 외에 host 매칭도 같이 해야 함.
+      이 함수가 본인이 소유한 도메인 목록을 반환.
+    """
+    try:
+        su_id = uuid.UUID(supabase_user_id)
+    except (ValueError, AttributeError, TypeError):
+        return []
+
+    pool = get_pool()
+    rows = await pool.fetch(
+        """
+        SELECT DISTINCT r.inbound_domain
+        FROM routers r
+        JOIN tenants t ON r.tenant_id = t.tenant_id
+        WHERE t.supabase_user_id = $1
+          AND r.is_active = TRUE
+          AND r.inbound_domain IS NOT NULL
+        """,
+        su_id,
+    )
+    return [r["inbound_domain"] for r in rows if r["inbound_domain"]]
+
+
+# ============================================================
 # [추가] Admin 전용 함수 - AdminDashboardPage 의 카드/목록용
 # ============================================================
 
 async def get_admin_tenant_summary() -> dict:
-    """
-    관리자 대시보드 카드용 집계 정보.
-      - 등록된 고객사 수 (전체)
-      - 활성 상태 고객사 수
-      - 최근 가입한 고객사 (회사명 + 가입일)
-    한 번의 쿼리로 다 처리.
-    """
+    """관리자 대시보드 카드용 집계 정보."""
     pool = get_pool()
     async with pool.acquire() as conn:
-        # 카운트 집계 (전체 + 상태별)
         counts = await conn.fetchrow(
             """
             SELECT
@@ -158,7 +178,6 @@ async def get_admin_tenant_summary() -> dict:
             """
         )
 
-        # 가장 최근 가입 1건
         latest = await conn.fetchrow(
             """
             SELECT company_name, created_at
@@ -179,13 +198,7 @@ async def get_admin_tenant_summary() -> dict:
 
 
 async def list_all_tenants_for_admin() -> list[dict]:
-    """
-    관리자가 보는 전체 고객사 목록.
-    routers 와 LEFT JOIN 해서 등록한 도메인 정보도 같이 반환.
-
-    asyncpg 는 json_agg 결과를 문자열로 반환할 수 있어서,
-    routes 를 명시적으로 json.loads 로 파싱해서 항상 배열로 반환.
-    """
+    """관리자가 보는 전체 고객사 목록. routers JOIN."""
     pool = get_pool()
     rows = await pool.fetch(
         """
@@ -217,7 +230,6 @@ async def list_all_tenants_for_admin() -> list[dict]:
     )
 
     def _parse_routes(value):
-        """asyncpg 가 문자열로 줄 수도, 이미 list 로 줄 수도 있어서 양쪽 다 처리."""
         if isinstance(value, str):
             try:
                 return json.loads(value)
