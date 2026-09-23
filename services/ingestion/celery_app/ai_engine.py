@@ -48,14 +48,18 @@ def check_re2_compatible(pattern: str) -> None:
             raise re.error("Go RE2 미지원: 반복 횟수 1000 초과")
 
 
-def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> dict:
+def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta: dict = None) -> dict:
     """
     AI를 호출하여 공격 로그를 분석하고 WAF 룰(정규식)을 생성합니다.
     문법 오류 시 피드백 루프를 통해 재시도합니다.
+    meta 를 넘기면 실험 로그용으로 model / attempts / errors(시도별 실패 종류) 를 채운다.
     """
+    if meta is None:
+        meta = {}
+    meta.update(model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), attempts=0, errors=[])
     client = _get_client()
     chat = client.chats.create(
-        model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
+        model=meta["model"],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
 
@@ -78,6 +82,7 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> d
     """
 
     for attempt in range(max_retries):
+        meta["attempts"] = attempt + 1
         try:
             print(f"--- [시도 {attempt + 1}/{max_retries}] AI 룰 생성 중 ---")
             response = chat.send_message(prompt)
@@ -102,16 +107,20 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> d
             # JSON 파싱 에러 발생 시 피드백
             error_msg = f"JSON 파싱 에러가 발생했습니다: {str(e)}. 반드시 올바른 JSON 형식으로만 응답하세요."
             prompt = error_msg
+            meta["errors"].append({"kind": "json", "msg": str(e)})
 
         except re.error as e:
             # 정규식 문법 에러 발생 시 피드백
             error_msg = f"당신이 생성한 정규식 '{generated_regex}'에 문법 오류가 있습니다: {str(e)}. 이 오류를 수정하여 다시 정규식을 작성하세요."
             print(f"⚠️ 정규식 오류 발생. 피드백 전송: {error_msg}")
             prompt = error_msg
+            kind = "re2" if str(e).startswith("Go RE2") else "regex"
+            meta["errors"].append({"kind": kind, "msg": str(e)})
 
         except Exception as e:
             error_msg = f"알 수 없는 에러: {str(e)}. 다시 시도하세요."
             prompt = error_msg
+            meta["errors"].append({"kind": "other", "msg": str(e)})
 
     # 최대 재시도 횟수를 초과한 경우
     print("❌ 최대 재시도 횟수 초과. AI 룰 생성 실패.")
