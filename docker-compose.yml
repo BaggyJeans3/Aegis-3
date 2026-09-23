@@ -125,6 +125,7 @@ services:
       - MONGO_PORT=27017
       - MONGO_AUTH_SOURCE=admin
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
       - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
       - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
     depends_on:
@@ -168,6 +169,7 @@ services:
       - MONGO_COLLECTION_NAME=traffic_logs
       - RISK_ANALYZER_URL=http://detection-engine:5000/analyze
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash}
       # 운영 기본값 80 (CRITICAL 직전). 시연 시에만 demo_setup.sh 가 env 로 30 주입.
       - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
       - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
