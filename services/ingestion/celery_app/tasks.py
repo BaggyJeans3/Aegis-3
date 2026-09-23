@@ -38,6 +38,11 @@ MONGO_URI = os.getenv(
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "aegis_logs")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "security_logs")
 
+# AI 룰 생애주기 이벤트(생성·관찰 매칭·승격·보관·재무장) — 오탐율/탐지율 실험 로그
+# worker 는 생성 이벤트를 직접 저장하고, sidecar 는 이 큐에 LPUSH → consume 태스크가 적재.
+AI_RULE_EVENT_QUEUE = os.getenv("AI_RULE_EVENT_QUEUE", "aegis:ai-rule-events")
+AI_RULE_EVENTS_COLLECTION = os.getenv("AI_RULE_EVENTS_COLLECTION", "ai_rule_events")
+
 # AI 룰 생성 임계값 및 Nginx 사이드카(룰 주입) 엔드포인트
 AI_RULE_THRESHOLD = int(os.getenv("AI_RULE_THRESHOLD", "80"))
 NGINX_SIDECAR_URL = os.getenv(
@@ -221,13 +226,49 @@ def _build_mongo_uri():
     return MONGO_URI
 
 
-def get_mongo_collection():
+def get_mongo_collection(name=None):
     """
-    MongoDB collection 객체를 반환한다.
+    MongoDB collection 객체를 반환한다. name 미지정 시 보안 로그 컬렉션.
     """
     client = MongoClient(_build_mongo_uri())
     db = client[MONGO_DB_NAME]
-    return db[MONGO_COLLECTION_NAME]
+    return db[name or MONGO_COLLECTION_NAME]
+
+
+def _log_ai_rule_event(event: dict) -> None:
+    """AI 룰 실험 로그 1건 저장. 실패해도 본 파이프라인에는 영향 없음."""
+    event.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    event.setdefault("source", "worker")
+    try:
+        get_mongo_collection(AI_RULE_EVENTS_COLLECTION).insert_one(event)
+    except Exception as log_err:
+        print(f"[Worker] ⚠️ AI 룰 이벤트 저장 실패(무시): {log_err}")
+
+
+def drain_ai_rule_events(batch_size: int = 500) -> int:
+    """sidecar 가 큐에 쌓은 AI 룰 이벤트를 MongoDB 로 옮긴다. 저장 실패 시 큐로 되돌림."""
+    raws = []
+    while len(raws) < batch_size:
+        raw = redis_client.rpop(AI_RULE_EVENT_QUEUE)
+        if not raw:
+            break
+        raws.append(raw)
+    docs = []
+    for r in raws:
+        try:
+            docs.append(json.loads(r))
+        except ValueError:
+            print(f"[Worker] ⚠️ 깨진 AI 룰 이벤트 버림: {r[:200]}")
+    if not docs:
+        return 0
+    try:
+        get_mongo_collection(AI_RULE_EVENTS_COLLECTION).insert_many(docs)
+    except Exception as mongo_err:
+        # RPOP 한 쪽(꼬리)으로 되돌려 다음 주기에 재시도
+        redis_client.rpush(AI_RULE_EVENT_QUEUE, *[json.dumps(d) for d in reversed(docs)])
+        print(f"[Worker] ⚠️ AI 룰 이벤트 적재 실패, 큐로 복원: {mongo_err}")
+        return 0
+    return len(docs)
 
 
 def build_mongo_document(raw_event, analyzer_result):
@@ -310,8 +351,8 @@ def _build_coraza_rule(rule: dict) -> str:
     )
 
 
-def _inject_rule_to_nginx(rule: dict) -> None:
-    """생성된 WAF 룰을 Nginx 사이드카로 전송"""
+def _inject_rule_to_nginx(rule: dict):
+    """생성된 WAF 룰을 Nginx 사이드카로 전송. 성공 시 rule_id, 실패 시 None."""
     try:
         rule_str = _build_coraza_rule(rule)
         resp = requests.post(
@@ -320,8 +361,11 @@ def _inject_rule_to_nginx(rule: dict) -> None:
             timeout=5,
         )
         print(f"[Worker] WAF 룰 주입 응답: {resp.status_code} - {resp.text[:200]}")
+        if resp.ok:
+            return int(re.search(r"id:(\d+)", rule_str).group(1))
     except Exception as inj_err:
         print(f"[Error] Nginx 사이드카 룰 주입 실패: {inj_err}")
+    return None
 
 
 def _report_to_analyzer(ip: str, attack_type: str) -> None:
@@ -464,7 +508,10 @@ def process_security_log(self, log_data):
 
             # LLM 호출 (기존 로직)
             print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
-            ai_rule = generate_waf_rule_with_feedback(raw_event)
+            gen_meta = {}
+            t0 = time.time()
+            ai_rule = generate_waf_rule_with_feedback(raw_event, meta=gen_meta)
+            llm_latency_ms = int((time.time() - t0) * 1000)
 
             # ──────────────────────────────────────────────────────────
             # [Aegis-3 SOAR] 작업 7 — 클러스터 캐시 저장
@@ -486,11 +533,27 @@ def process_security_log(self, log_data):
                 except Exception as redis_err:
                     print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
 
+            rule_id = None
             if ai_rule and ai_rule.get("regex"):
                 print(f"[Worker] ✅ AI 룰 생성됨: {ai_rule.get('rule_name')} (confidence={ai_rule.get('confidence_score')})")
-                _inject_rule_to_nginx(ai_rule)
+                rule_id = _inject_rule_to_nginx(ai_rule)
             else:
                 print(f"[Worker] ⚠️ AI 룰 생성 실패(반환 None) — 주입 건너뜀")
+
+            _log_ai_rule_event({
+                "type": "generated" if ai_rule else "generation_failed",
+                "rule_id": rule_id,  # sidecar 이벤트와 조인 키. 주입 실패 시 None
+                "rule_name": (ai_rule or {}).get("rule_name"),
+                "regex": (ai_rule or {}).get("regex"),
+                "confidence_score": (ai_rule or {}).get("confidence_score"),
+                "llm_latency_ms": llm_latency_ms,
+                **gen_meta,  # model, attempts, errors
+                "event_id": raw_event.get("event_id"),
+                "ip": ip,
+                "method": raw_event.get("method"),
+                "path": raw_event.get("path"),
+                "risk_score": risk_score,
+            })
 
         print("[Worker] 로그 처리 완료")
 
@@ -532,6 +595,11 @@ def consume_logs_from_redis_queue():
 
         process_security_log.delay(log_raw)
         logs_processed += 1
+
+    try:
+        drain_ai_rule_events()
+    except Exception as drain_err:
+        print(f"[Worker] ⚠️ AI 룰 이벤트 drain 실패(무시): {drain_err}")
 
     message = f"{logs_processed}개의 로그를 Redis 큐에서 꺼내 처리 작업에 할당했습니다."
     print(f"[Worker] {message}")

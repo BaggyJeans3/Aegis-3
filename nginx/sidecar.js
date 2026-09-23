@@ -51,6 +51,9 @@ const BLOCK_SIGNAL_RULE_IDS = (process.env.BLOCK_SIGNAL_RULE_IDS || '949110,9591
 // proxy/worker 와 동일한 큐. worker(consume_logs_from_redis_queue)가 RPOP 해서 저장한다.
 const SECURITY_EVENT_QUEUE =
   process.env.SECURITY_EVENT_QUEUE || 'aegis:security-events'
+// AI 룰 생애주기 이벤트 큐(오탐율/탐지율 실험 로그). worker 가 MongoDB ai_rule_events 로 적재.
+const AI_RULE_EVENT_QUEUE =
+  process.env.AI_RULE_EVENT_QUEUE || 'aegis:ai-rule-events'
 
 // Shadow 판정 B(IP 평판)용 Redis. 연결 실패해도 핵심기능은 계속(fail-open: B 생략=C만).
 const REDIS_HOST = process.env.REDIS_HOST || 'redis'
@@ -73,6 +76,15 @@ redisClient.connect().catch((err) => {
     `[Sidecar] Redis 연결 실패: ${err.message} — Shadow 판정은 C(CRS 교차검증)만 사용`,
   )
 })
+
+// AI 룰 이벤트 1건 적재. Redis 미연결 시 버림(fail-open, 룰 동작에는 영향 없음).
+function logRuleEvent(type, data) {
+  if (!redisReady) return
+  const event = { type, source: 'sidecar', ts: new Date().toISOString(), ...data }
+  redisClient
+    .lPush(AI_RULE_EVENT_QUEUE, JSON.stringify(event))
+    .catch((err) => console.warn(`[RuleLog] ${type} 적재 실패: ${err.message}`))
+}
 
 // Shadow Mode 중인 룰들
 const shadowRules = new Map() // rule_id → { startedAt, ruleText, expiresAt }
@@ -170,6 +182,7 @@ app.post('/api/v1/rules/inject', (req, res) => {
   })
   shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
   console.log(`[Shadow] injected ${ruleId} (will judge in ${SHADOW_DURATION}s)`)
+  logRuleEvent('shadow_injected', { rule_id: ruleId, rule: shadowRule })
 
   // 5. nginx reload (배치). 룰은 파일+메모리에 이미 반영됨, 적용만 합산 지연.
   scheduleReload()
@@ -255,6 +268,7 @@ app.post('/api/v1/rules/rearm/:id', (req, res) => {
   console.log(
     `[Re-arm] ${ruleId} restored from archive (was ${archived.reason}) → shadow`,
   )
+  logRuleEvent('rearmed', { rule_id: ruleId, prev_reason: archived.reason })
 
   scheduleReload()
   return res.json({ status: 'rearmed_shadow', rule_id: ruleId, reload: 'queued' })
@@ -374,14 +388,27 @@ async function isIpBlacklisted(ip) {
   }
 }
 
+// 이벤트 로그용 요청 식별 정보 (정답 라벨링은 분석 시 ip/경로로 한다)
+function txnInfo(txn) {
+  return { ip: txn.ip, method: txn.method, host: txn.host, path: txn.path, query: txn.query }
+}
+
 // shadow 룰 매칭 1건을 공격/오탐으로 분류해 통계 누적
-async function classifyShadowMatch(ruleId, crsCorroborated, ip) {
+async function classifyShadowMatch(ruleId, crsCorroborated, txn) {
   const stats = shadowStats.get(ruleId)
   if (!stats) return
   stats.total += 1
 
   // C(CRS 동시매칭) 또는 B(공격자 IP) 중 하나면 '공격 확정'
+  const ip = txn.ip
   const ipBad = crsCorroborated ? false : await isIpBlacklisted(ip)
+  logRuleEvent('shadow_match', {
+    rule_id: ruleId,
+    verdict: crsCorroborated || ipBad ? 'attack' : 'normal_est', // 정상 추정 표본
+    crs_corroborated: crsCorroborated,
+    ip_blacklisted: ipBad,
+    ...txnInfo(txn),
+  })
   if (crsCorroborated || ipBad) {
     stats.attack += 1
     console.log(
@@ -472,7 +499,14 @@ function finalizeTransaction(txn) {
   const crsCorroborated = ids.some(isCorroboratingRule)
   for (const id of ids) {
     if (shadowRules.has(id)) {
-      classifyShadowMatch(id, crsCorroborated, txn.ip)
+      classifyShadowMatch(id, crsCorroborated, txn)
+    } else if (liveRules.has(id)) {
+      // 승격된(deny) AI 룰의 실제 차단 1건 — 탐지율/실오탐 산출용
+      logRuleEvent('live_match', {
+        rule_id: id,
+        crs_corroborated: crsCorroborated,
+        ...txnInfo(txn),
+      })
     }
   }
 
@@ -741,6 +775,8 @@ function promoteRule(ruleId) {
       expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
     })
 
+    logRuleEvent('promoted', { rule_id: ruleId, ...shadowSummary(ruleId, now) })
+
     // nginx reload (배치)
     console.log(`[Promote] ${ruleId} promoted to deny (reload queued)`)
     scheduleReload()
@@ -748,6 +784,16 @@ function promoteRule(ruleId) {
   } catch (err) {
     console.error(`[Promote] error for ${ruleId}:`, err.message)
     return false
+  }
+}
+
+// 승격/보관 판정 시점의 관찰 통계 (이벤트 로그용). shadow 가 아니면 stats=null.
+function shadowSummary(ruleId, now) {
+  const info = shadowRules.get(ruleId)
+  return {
+    from: shadowRules.has(ruleId) ? 'shadow' : liveRules.has(ruleId) ? 'live' : 'unknown',
+    stats: shadowStats.get(ruleId) || null, // { total, attack, fp(=정상 추정) }
+    observed_s: info ? Math.floor((now - info.startedAt) / 1000) : null,
   }
 }
 
@@ -786,6 +832,7 @@ function revokeRule(ruleId, reason = 'manual') {
 
     // 물리 삭제 대신 보관: 폐기 근거(reason) 추적 + 재공격 시 재무장 가능
     archiveRule(ruleId, removed.join('\n'), reason)
+    logRuleEvent('archived', { rule_id: ruleId, reason, ...shadowSummary(ruleId, Date.now()) })
 
     fs.writeFileSync(rulePath, newLines.join('\n'))
 
