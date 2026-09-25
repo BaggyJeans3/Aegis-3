@@ -368,6 +368,63 @@ def _inject_rule_to_nginx(rule: dict):
     return None
 
 
+# ============================================================
+# 자동 재무장 — 공격 지문(정규화 패턴 해시, compute_cluster_key 와 동일) → 그 공격으로
+# 만든 rule_id 장부. 같은 지문의 공격이 다시 오면 LLM 대신 보관된 룰을 재무장한다.
+# 재무장된 룰은 shadow(관찰)로 돌아가 재검증부터 받는다.
+# ============================================================
+
+RULE_FP_PREFIX = "aegis:rule-fp:"
+RULE_FP_TTL_SECONDS = int(os.getenv("RULE_FP_TTL_SECONDS", str(30 * 86400)))  # 30일
+
+
+def _remember_rule_fingerprint(fingerprint: str, rule_id: int) -> None:
+    try:
+        redis_client.setex(RULE_FP_PREFIX + fingerprint, RULE_FP_TTL_SECONDS, rule_id)
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 룰 지문 장부 저장 실패: {redis_err}")
+
+
+def _try_auto_rearm(fingerprint: str):
+    """
+    장부에 룰이 있으면 사이드카 재무장 호출.
+    - 200 rearmed: 보관본을 shadow 로 되살림
+    - 409 already_active: 룰이 이미 관찰/차단 중 → 새 룰 불필요
+    그 외(장부 없음, 보관본 없음 404, Redis/사이드카 장애) → None = 기존대로 LLM 진행.
+    """
+    try:
+        rule_id = redis_client.get(RULE_FP_PREFIX + fingerprint)
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 룰 지문 장부 조회 실패: {redis_err} — LLM 진행")
+        return None
+    if not rule_id:
+        return None
+
+    rearm_url = NGINX_SIDECAR_URL.rsplit("/", 1)[0] + f"/rearm/{rule_id}"
+    try:
+        resp = requests.post(rearm_url, timeout=5)
+    except Exception as req_err:
+        print(f"[Worker] ⚠️ 재무장 호출 실패: {req_err} — LLM 진행")
+        return None
+    print(f"[Worker] 재무장 응답(rule {rule_id}): {resp.status_code} - {resp.text[:200]}")
+    if resp.status_code == 200:
+        return {"result": "rearmed", "rule_id": int(rule_id)}
+    if resp.status_code == 409:
+        return {"result": "already_active", "rule_id": int(rule_id)}
+    return None
+
+
+def _blacklist_ip(blacklist_key, ip) -> None:
+    """고위험 IP 24h 블랙리스트 — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊는다."""
+    if not blacklist_key:
+        return
+    try:
+        redis_client.setex(blacklist_key, 86400, "1")
+        print(f"[Worker] 🔒 IP {ip} blacklist 등록 (TTL 24h)")
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
+
+
 def _report_to_analyzer(ip: str, attack_type: str) -> None:
     """
     고위험 이벤트를 analyzer(/api/v1/report)로 보고.
@@ -506,6 +563,38 @@ def process_security_log(self, log_data):
             except Exception as redis_err:
                 print(f"[Worker] ⚠️ 클러스터 캐시 조회 실패: {redis_err} — fail-open으로 LLM 진행")
 
+            # ──────────────────────────────────────────────────────────
+            # 자동 재무장 — 같은 지문으로 만든 룰이 있으면 LLM 대신 재무장
+            # ──────────────────────────────────────────────────────────
+            fingerprint = cluster_key.rsplit(":", 1)[1]
+            rearm = _try_auto_rearm(fingerprint)
+            if rearm:
+                _blacklist_ip(blacklist_key, ip)
+                try:
+                    redis_client.incr("aegis:stats:rearm_skipped")
+                except Exception:
+                    pass
+                print(f"[Worker] 🔁 자동 재무장 ({rearm['result']}, rule {rearm['rule_id']}) — LLM 호출 skip")
+                _log_ai_rule_event({
+                    "type": "auto_rearm",
+                    **rearm,  # result, rule_id
+                    "fingerprint": fingerprint,
+                    "event_id": raw_event.get("event_id"),
+                    "ip": ip,
+                    "method": raw_event.get("method"),
+                    "path": raw_event.get("path"),
+                    "risk_score": risk_score,
+                })
+                return {
+                    "status": "success",
+                    "event_id": raw_event.get("event_id"),
+                    "risk_score": risk_score,
+                    "level": detection_result.get("level"),
+                    "llm_skipped": True,
+                    "reason": rearm["result"],
+                    "rule_id": rearm["rule_id"],
+                }
+
             # LLM 호출 (기존 로직)
             print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
             gen_meta = {}
@@ -525,18 +614,14 @@ def process_security_log(self, log_data):
                     print(f"[Worker] ⚠️ 클러스터 캐시 저장 실패: {redis_err}")
 
             # LLM 호출 후 IP를 24h 블랙리스트 등록 (성공/실패 모두)
-            # — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊을 수 있도록
-            if blacklist_key:
-                try:
-                    redis_client.setex(blacklist_key, 86400, "1")
-                    print(f"[Worker] 🔒 IP {ip} blacklist 등록 (TTL 24h)")
-                except Exception as redis_err:
-                    print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
+            _blacklist_ip(blacklist_key, ip)
 
             rule_id = None
             if ai_rule and ai_rule.get("regex"):
                 print(f"[Worker] ✅ AI 룰 생성됨: {ai_rule.get('rule_name')} (confidence={ai_rule.get('confidence_score')})")
                 rule_id = _inject_rule_to_nginx(ai_rule)
+                if rule_id:
+                    _remember_rule_fingerprint(fingerprint, rule_id)
             else:
                 print(f"[Worker] ⚠️ AI 룰 생성 실패(반환 None) — 주입 건너뜀")
 
@@ -548,6 +633,7 @@ def process_security_log(self, log_data):
                 "confidence_score": (ai_rule or {}).get("confidence_score"),
                 "llm_latency_ms": llm_latency_ms,
                 **gen_meta,  # model, attempts, errors
+                "fingerprint": fingerprint,
                 "event_id": raw_event.get("event_id"),
                 "ip": ip,
                 "method": raw_event.get("method"),

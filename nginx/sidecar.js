@@ -597,6 +597,7 @@ function startLogWatcher() {
   })
 }
 
+restoreStateFromFiles()
 startLogWatcher()
 console.log(`[Scheduler] shadow expiration check every 10s`)
 console.log(
@@ -776,6 +777,10 @@ function promoteRule(ruleId) {
     })
 
     logRuleEvent('promoted', { rule_id: ruleId, ...shadowSummary(ruleId, now) })
+    // 관찰 상태에서 내림. (수동 promote API 로 올린 룰이 shadow 에 남아 관찰 판정을
+    //  계속 받다가 undersampled 로 보관되던 버그 방지)
+    shadowRules.delete(ruleId)
+    shadowStats.delete(ruleId)
 
     // nginx reload (배치)
     console.log(`[Promote] ${ruleId} promoted to deny (reload queued)`)
@@ -810,6 +815,60 @@ function archiveRule(ruleId, ruleText, reason) {
   } catch (err) {
     console.error(`[Archive] write failed for ${ruleId}:`, err.message)
   }
+}
+
+// 사이드카 재시작 시 메모리 상태 복구. 파일(dynamic.conf·archived.conf)이 원본이다.
+// 관찰/TTL 시계는 재시작 시점부터 다시 센다(관찰 룰은 처음부터 재관찰, 라이브 룰은 TTL 갱신).
+function restoreStateFromFiles() {
+  const now = Date.now()
+  const readLines = (file) => {
+    try {
+      return fs.readFileSync(file, 'utf8').split('\n')
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error(`[Restore] ${file} read failed:`, err.message)
+      return []
+    }
+  }
+
+  // archived.conf: "# archived id=<id> reason=<r> at=<iso>" 다음 줄이 룰 원문. 같은 id 는 마지막 기록이 유효.
+  const archLines = readLines(RULE_ARCHIVE_FILE)
+  archLines.forEach((line, i) => {
+    const m = line.match(/^# archived id=(\d+) reason=(\S+) at=(\S+)/)
+    if (!m) return
+    archivedRules.set(parseInt(m[1], 10), {
+      ruleText: archLines[i + 1] || '',
+      reason: m[2],
+      archivedAt: Date.parse(m[3]) || now,
+    })
+  })
+
+  let shadow = 0
+  let live = 0
+  for (const line of readLines(rulePath)) {
+    const m = line.match(/id:(\d+)/)
+    if (!m || line.trim().startsWith('#')) continue
+    const ruleId = parseInt(m[1], 10)
+    archivedRules.delete(ruleId) // 보관 후 재무장·재주입된 룰은 활성 상태가 우선
+    if (/\bdeny\b/.test(line)) {
+      liveRules.set(ruleId, {
+        promotedAt: now,
+        lastMatchedAt: now,
+        expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
+      })
+      live++
+    } else {
+      shadowRules.set(ruleId, {
+        startedAt: now,
+        ruleText: line,
+        expiresAt: now + TTL_SECONDS * 1000,
+      })
+      shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
+      shadow++
+    }
+  }
+  console.log(
+    `[Restore] 파일에서 상태 복구: shadow=${shadow}, live=${live}, archived=${archivedRules.size}`,
+  )
 }
 
 // 룰을 활성 룰 파일(dynamic.conf)에서 내린다. 단, 삭제하지 않고 보관(archive)하여
