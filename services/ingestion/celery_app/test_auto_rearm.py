@@ -129,3 +129,21 @@ def test_different_attack_goes_to_llm(env):
     other = dict(event("2.2.2.2", 1), path="/admin/.env")
     run(other)
     assert calls["llm"] == 2 and calls["rearm"] == []
+
+
+def test_honeypot_hit_triggers_ai_rule_even_with_zero_score(env, monkeypatch):
+    r, calls, _ = env
+    real_post = tasks.requests.post
+
+    def zero_score(url, json=None, timeout=None):
+        if url.endswith("/analyze"):
+            return Resp(200, {"detection_result": {"risk_score": 0, "level": "LOW"}})
+        return real_post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(tasks.requests, "post", zero_score)
+    run(dict(event("3.3.3.3", 1), event_type="honeypot_hit", path="/.env"))
+    assert calls["llm"] == 1
+
+    run(dict(event("4.4.4.4", 1), event_type="request", path="/other"))  # 0점 일반 요청은 그대로 제외
+    run(dict(event("5.5.5.5", 1), event_type="waf_blocked", path="/x"))  # CRS 차단 이벤트도 제외
+    assert calls["llm"] == 1

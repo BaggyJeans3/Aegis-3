@@ -498,7 +498,11 @@ def process_security_log(self, log_data):
         # ------------------------------------------------------------
         detection_result = analyzer_result.get("detection_result", {})
         risk_score = int(detection_result.get("risk_score") or 0)
-        if risk_score >= AI_RULE_THRESHOLD:
+        # 허니팟 접근은 정상 사용자가 올 일 없는 확정 공격 신호인데 detector 는 점수를 주지 않는다.
+        # → 점수와 무관하게 AI 룰 생성 대상. (waf_blocked 는 제외: CRS 가 이미 막는 공격이라
+        #    뒤에 서는 AI 룰은 매칭될 기회가 없음)
+        is_honeypot = str(raw_event.get("event_type") or "").lower() == "honeypot_hit"
+        if risk_score >= AI_RULE_THRESHOLD or is_honeypot:
             # ──────────────────────────────────────────────────────────
             # [Aegis-3 SOAR] IP 평판 — 작업 6-A
             # LLM 호출 전 블랙리스트 체크: 24시간 내 이미 악성 판정된 IP면
@@ -596,7 +600,8 @@ def process_security_log(self, log_data):
                 }
 
             # LLM 호출 (기존 로직)
-            print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
+            trigger = "honeypot_hit" if is_honeypot else f"risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}"
+            print(f"[Worker] 🧠 {trigger}, AI 룰 생성 시작")
             gen_meta = {}
             t0 = time.time()
             ai_rule = generate_waf_rule_with_feedback(raw_event, meta=gen_meta)

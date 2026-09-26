@@ -572,7 +572,8 @@ function startLogWatcher() {
     // B(요청) 파트: 요청라인(METHOD URI HTTP/x)과 Host 헤더 캡처 → 차단 로그용
     if (partB) {
       if (expectReqLine && line.trim()) {
-        const rl = line.trim().match(/^([A-Z]+)\s+(\S+)\s+HTTP\//)
+        // Coraza native 는 "GET /p?q 1.1" 처럼 'HTTP/' 없이 기록한다 → 둘 다 허용
+        const rl = line.trim().match(/^([A-Z]+)\s+(\S+)\s+(?:HTTP\/)?\d/)
         if (rl) {
           txn.method = rl[1]
           const uri = rl[2]
