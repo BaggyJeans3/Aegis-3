@@ -3,6 +3,10 @@ from google.genai import types
 import re
 import json
 import os
+import time
+
+# LLM API 오류(503·네트워크) 재시도 대기 기준(초). 시도마다 2배 (2s, 4s …)
+API_RETRY_BASE_SECONDS = float(os.environ.get("AI_API_RETRY_BASE_SECONDS", "2"))
 
 def _get_client():
     """
@@ -83,9 +87,19 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta
 
     for attempt in range(max_retries):
         meta["attempts"] = attempt + 1
+        print(f"--- [시도 {attempt + 1}/{max_retries}] AI 룰 생성 중 ---")
         try:
-            print(f"--- [시도 {attempt + 1}/{max_retries}] AI 룰 생성 중 ---")
             response = chat.send_message(prompt)
+        except Exception as e:
+            # API/네트워크 오류(503 과부하, DNS 등)는 모델 답변 문제가 아니므로 피드백하지 않고
+            # 같은 요청을 잠시 후 재전송한다. (피드백으로 바꾸면 모델이 원래 과제를 잃는다)
+            meta["errors"].append({"kind": "api", "msg": str(e)})
+            print(f"⚠️ LLM API 오류, 같은 요청 재시도 예정: {e}")
+            if attempt + 1 < max_retries:
+                time.sleep(API_RETRY_BASE_SECONDS * 2 ** attempt)
+            continue
+
+        try:
             result = json.loads(response.text)
 
             # 1. JSON 구조 검증 (필요한 키가 다 있는지)
@@ -116,6 +130,11 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta
             prompt = error_msg
             kind = "re2" if str(e).startswith("Go RE2") else "regex"
             meta["errors"].append({"kind": kind, "msg": str(e)})
+
+        except ValueError as e:
+            # 필수 키 누락 등 응답 구조 오류
+            prompt = f"응답 형식 오류: {str(e)}. 앞서 요청한 출력 JSON 포맷(rule_name, description, regex, confidence_score)으로 다시 응답하세요."
+            meta["errors"].append({"kind": "schema", "msg": str(e)})
 
         except Exception as e:
             error_msg = f"알 수 없는 에러: {str(e)}. 다시 시도하세요."
