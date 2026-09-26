@@ -19,3 +19,6 @@ __pycache__/
 # Docker
 .docker/
 soar/alert_events.jsonl
+
+# 실험 결과 데이터 (scripts/experiment/ai_rule_experiment.py 실행 산출물)
+scripts/experiment/results/
