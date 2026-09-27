@@ -58,6 +58,8 @@ services:
       - DB_PASSWORD=${POSTGRES_PASSWORD}
       - DB_NAME=aegis_proxy
       - MONGO_URI=mongodb://aegis_user:${MONGO_PASSWORD}@mongodb:27017/aegis_logs?authSource=admin
+      # /admin/routes/refresh (route 캐시 즉시 갱신용) 인증 키. 없으면 해당 엔드포인트는 항상 401.
+      - ADMIN_REFRESH_KEY=${ADMIN_REFRESH_KEY}
     depends_on:
       - postgres-db
       - redis
