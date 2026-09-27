@@ -1,0 +1,27 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "MuShop API", "version": "1.0" },
+  "paths": {
+    "/api/login": {
+      "post": { "summary": "로그인 (SQL Injection 공격이 주로 발생하는 지점)" }
+    },
+    "/api/register": {
+      "post": { "summary": "회원가입 (데이터 유효성 검사 대상)" }
+    },
+    "/api/catalogue": {
+      "get": { "summary": "전체 상품 목록 조회" }
+    },
+    "/api/catalogue/{id}": {
+      "get": { "summary": "특정 상품 상세 정보" }
+    },
+    "/api/carts/{id}/items": {
+      "post": { "summary": "장바구니 담기 (인증 토큰 변조 감시)" }
+    },
+    "/api/orders": {
+      "post": { "summary": "결제 및 주문 생성 (IDOR 공격 차단 필요)" }
+    },
+    "/api/assets/{path}": {
+      "get": { "summary": "정적 리소스(이미지 등)" }
+    }
+  }
+}

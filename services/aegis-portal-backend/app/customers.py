@@ -3,21 +3,74 @@
 
 흐름:
   등록 -> tenants 테이블에 INSERT (회사명, 요금제, 명세서, supabase_user_id)
-       -> 거기서 나온 tenant_id 로 routers 테이블에도 INSERT (도메인, 오리진)
+       -> spec_text(OpenAPI JSON)를 파싱해 구체적인 경로별 라우트 + 캐치올(/*)
+          + 디코이(허니팟) 라우트를 routers 테이블에 다건 INSERT
   조회 -> supabase_user_id 로 그 회원이 소유한 고객사 목록 반환
 
 api_key 는 백엔드가 자동 생성한다.
+spec_text 가 OpenAPI JSON이 아니거나 파싱에 실패하면 구체 라우트 없이
+캐치올 + 디코이만 등록한다(서비스 자체는 계속 동작).
 """
 import json
 import secrets
 import uuid
 
 from .postgres import get_pool
+from .spec_parser import parse_openapi_spec, DEFAULT_DECOY_ROUTES
+
+# 우선순위: 낮을수록 먼저 매칭 (proxy/app.js findRouteFromCache 참고)
+PRIORITY_DECOY = 10
+PRIORITY_SPECIFIC = 50
+PRIORITY_CATCHALL = 100
+
+_ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
 
 
 def _generate_api_key() -> str:
     """대시보드 접근용 API Key 생성. 'aegis_' + 32자 랜덤 hex."""
     return "aegis_" + secrets.token_hex(16)
+
+
+def _build_router_rows(spec_text: str, target_origin: str) -> tuple[list[dict], int]:
+    """spec_text -> routers INSERT 행 목록. (rows, 파싱된 구체 라우트 개수) 반환."""
+    parsed_routes = parse_openapi_spec(spec_text)
+    real_paths = {r["path_pattern"] for r in parsed_routes}
+
+    rows = []
+
+    for route in parsed_routes:
+        rows.append({
+            "path_pattern": route["path_pattern"],
+            "methods": route["methods"],
+            "target_origin": target_origin or None,
+            "action_on_match": "proxy",
+            "priority": PRIORITY_SPECIFIC,
+            "description": route["description"],
+        })
+
+    if target_origin:
+        rows.append({
+            "path_pattern": "/*",
+            "methods": _ALL_METHODS,
+            "target_origin": target_origin,
+            "action_on_match": "proxy",
+            "priority": PRIORITY_CATCHALL,
+            "description": "캐치올: 명세에 없는 나머지 경로",
+        })
+
+    for decoy in DEFAULT_DECOY_ROUTES:
+        if decoy["path_pattern"] in real_paths:
+            continue
+        rows.append({
+            "path_pattern": decoy["path_pattern"],
+            "methods": _ALL_METHODS,
+            "target_origin": None,
+            "action_on_match": "honeypot",
+            "priority": PRIORITY_DECOY,
+            "description": decoy["description"],
+        })
+
+    return rows, len(parsed_routes)
 
 
 async def create_customer(
@@ -56,23 +109,35 @@ async def create_customer(
             )
 
             # 2. routers 삽입 (보호 도메인 라우팅 규칙)
-            #    target_origin 이 비어있으면 NULL 로 (허니팟/차단 대비)
-            await conn.execute(
-                """
-                INSERT INTO routers
-                    (tenant_id, inbound_domain, target_origin, action_on_match)
-                VALUES ($1, $2, $3, $4)
-                """,
-                tenant_row["tenant_id"],
-                inbound_domain,
-                target_origin if target_origin else None,
-                "proxy",
-            )
+            #    spec_text(OpenAPI JSON)를 파싱해 경로별 구체 라우트 + 캐치올(/*)
+            #    + 디코이(허니팟)를 함께 생성한다. 파싱 실패 시 캐치올+디코이만 남는다.
+            #    target_origin 이 비어있으면 캐치올도 만들지 않는다(허니팟/차단 전용 등록 대비).
+            router_rows, parsed_route_count = _build_router_rows(spec_text, target_origin)
+
+            for row in router_rows:
+                await conn.execute(
+                    """
+                    INSERT INTO routers
+                        (tenant_id, inbound_domain, target_origin, path_pattern,
+                         priority, allowed_methods, action_on_match, description)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    tenant_row["tenant_id"],
+                    inbound_domain,
+                    row["target_origin"],
+                    row["path_pattern"],
+                    row["priority"],
+                    row["methods"],
+                    row["action_on_match"],
+                    row["description"],
+                )
 
     return {
         "tenant_id": str(tenant_row["tenant_id"]),
         "company_name": tenant_row["company_name"],
         "api_key": tenant_row["api_key"],
+        "parsed_route_count": parsed_route_count,
+        "router_count": len(router_rows),
         "plan_type": tenant_row["plan_type"],
         "status": tenant_row["status"],
         "created_at": tenant_row["created_at"].isoformat(),
