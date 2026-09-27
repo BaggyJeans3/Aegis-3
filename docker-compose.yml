@@ -171,6 +171,8 @@ services:
       # 운영 기본값 80 (CRITICAL 직전). 시연 시에만 demo_setup.sh 가 env 로 30 주입.
       - AI_RULE_THRESHOLD=${AI_RULE_THRESHOLD:-80}
       - NGINX_SIDECAR_URL=${NGINX_SIDECAR_URL:-http://nginx:4000/api/v1/rules/inject}
+      # [처리량] Beat 1회(2초)당 큐에서 꺼낼 최대 건수. 기존 100 고정 = 최대 50 eps 병목.
+      - CONSUME_BATCH_SIZE=${CONSUME_BATCH_SIZE:-1000}
     depends_on:
       - redis
       - mongodb
@@ -178,7 +180,9 @@ services:
       - detection-engine
     networks:
       - aegis-net
-    command: celery -A tasks:celery_app worker --beat --loglevel=info
+    # [처리량] 태스크가 I/O 대기(HTTP·Mongo·LLM) 위주라 vCPU 수(t3.small=2)보다 많은 4 가 유리.
+    #          로컬 2 vCPU 측정: 동시성 2 → 272 eps, 4 → 381 eps, 6 → 375 eps(이득 없음)
+    command: celery -A tasks:celery_app worker --beat --loglevel=info --concurrency=${CELERY_CONCURRENCY:-4}
 
   # 9. 실시간 알림 및 차단 대응 엔진 (Node.js)
   analyzer:

@@ -14,6 +14,8 @@ echo "▸ Redis 시연 데이터 정리"
 sudo docker exec aegis-redis redis-cli DEL aegis:security-events > /dev/null
 sudo docker exec aegis-redis redis-cli KEYS "aegis:blacklist:203.0.113.99" | xargs -r sudo docker exec -i aegis-redis redis-cli DEL > /dev/null 2>&1
 sudo docker exec aegis-redis redis-cli KEYS "aegis:cluster:*" | xargs -r sudo docker exec -i aegis-redis redis-cli DEL > /dev/null 2>&1
+# analyzer 보고 쿨다운(REPORT_COOLDOWN_SECONDS, 기본 10분) 초기화 — 연속 리허설에서도 Slack 알림이 다시 뜨도록
+sudo docker exec aegis-redis redis-cli KEYS "aegis:reported:*" | xargs -r sudo docker exec -i aegis-redis redis-cli DEL > /dev/null 2>&1
 echo "  ✓ 시연 IP 블랙리스트 + 클러스터 캐시 삭제"
 echo ""
 

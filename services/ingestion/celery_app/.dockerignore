@@ -11,3 +11,9 @@ __pycache__/
 
 .env
 .env.local
+
+# pytest 스위트 디렉터리 (CI 전용)
+tests/
+
+# Celery Beat 스케줄 상태 파일 (컨테이너 실행 시 생성)
+celerybeat-schedule*
