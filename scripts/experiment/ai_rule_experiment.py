@@ -421,6 +421,49 @@ def cmd_run(a):
     print("\n" + md)
 
 
+# ── 여러 회차 합산 (논문 표) ────────────────────────────────────
+
+def cmd_report(run_ids, out_name):
+    """여러 실행 결과를 합쳐 논문용 표를 만든다. 탐지율·오탐율은 요청 수 기준 합산."""
+    runs = []
+    for rid in run_ids:
+        d = HERE / "results" / rid
+        runs.append((rid, json.loads((d / "summary.json").read_text(encoding="utf-8")),
+                     json.loads((d / "events.json").read_text(encoding="utf-8"))))
+    regex = {e["rule_id"]: e.get("regex") for _, _, ev in runs for e in ev
+             if e.get("type") == "generated" and e.get("rule_id")}
+    lat, gen_ok, gen_fail, rearm, errs = [], 0, 0, 0, Counter()
+    att = att_hit = nor = nor_hit = 0
+    per_scn = defaultdict(lambda: [0, 0])  # 시나리오 → [보냄, AI 룰이 막음]
+    lines = ["| 회차 | 모델 | 룰 생성 (성공/시도) | 자동 재무장 | 탐지율 | 오탐율 |", "| --- | --- | --- | --- | --- | --- |"]
+    for rid, s, ev in runs:
+        g, lv = s["generation"], s["live"]
+        lat += [e["llm_latency_ms"] for e in ev if e.get("type") == "generated" and e.get("llm_latency_ms")]
+        gen_ok += g["generated"]; gen_fail += g["failed"]; rearm += g.get("auto_rearmed", 0)
+        errs.update(g["error_kinds"])
+        att += lv["attack_sent"]; att_hit += lv["attack_blocked_by_ai_rule"]
+        nor += lv["normal_sent"]; nor_hit += lv["normal_blocked_by_ai_rule"]
+        for n, d in lv["per_scenario"].items():
+            per_scn[n][0] += d["sent"]; per_scn[n][1] += d["blocked_by_ai_rule"]
+        model = (s["params"].get("worker_env") or ["", ""])[-1]
+        lines.append(f"| {rid} | {model} | {g['generated']}/{g['generated'] + g['failed']} | {g.get('auto_rearmed', 0)} | "
+                     f"{lv['detection_rate_pct']}% ({lv['attack_blocked_by_ai_rule']}/{lv['attack_sent']}) | "
+                     f"{lv['false_positive_rate_pct']}% ({lv['normal_blocked_by_ai_rule']}/{lv['normal_sent']}) |")
+    lat.sort()
+    lines.append(f"| **합계** | | {gen_ok}/{gen_ok + gen_fail} ({pct(gen_ok, gen_ok + gen_fail)}%) | {rearm} | "
+                 f"**{pct(att_hit, att)}%** ({att_hit}/{att}) | **{pct(nor_hit, nor)}%** ({nor_hit}/{nor}) |")
+    lines += ["", f"- LLM 지연(ms, 성공 {len(lat)}건): " +
+              (f"최소 {lat[0]}, 중앙값 {lat[len(lat) // 2]}, 최대 {lat[-1]}" if lat else "없음"),
+              f"- LLM 실패 원인(시도 단위): {dict(errs)}", "",
+              "| 시나리오 | 탐지율 (합산) | 생성된 정규식 |", "| --- | --- | --- |"]
+    rule_of = {n: r["rule_id"] for _, s, _ in runs for n, r in s["generation"]["rules"].items() if r["rule_id"]}
+    for n, (sent, hit) in per_scn.items():
+        lines.append(f"| {n} | {pct(hit, sent)}% ({hit}/{sent}) | `{regex.get(rule_of.get(n))}` |")
+    md = "\n".join(lines) + "\n"
+    (HERE / "results" / f"{out_name}.md").write_text(md, encoding="utf-8")
+    print(md)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -432,11 +475,16 @@ def main():
     r.add_argument("--gen-timeout", type=int, default=240)
     r.add_argument("--judge-timeout", type=int, default=120)
     r.add_argument("--keep-routes", action="store_true", help="실험 도메인/경로를 지우지 않음")
+    rp = sub.add_parser("report", help="여러 실행 결과를 합쳐 논문용 표 생성")
+    rp.add_argument("run_ids", nargs="+")
+    rp.add_argument("--out", default="report")
     s = sub.add_parser("send", help="(내부용) 컨테이너 안에서 요청 전송")
     s.add_argument("plan")
     a = p.parse_args()
     if a.cmd == "send":
         cmd_send(a.plan)
+    elif a.cmd == "report":
+        cmd_report(a.run_ids, a.out)
     else:
         cmd_run(a)
 
