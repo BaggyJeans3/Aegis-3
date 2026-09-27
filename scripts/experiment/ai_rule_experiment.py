@@ -52,7 +52,8 @@ SCENARIOS = {
         "trigger": "honeypot",
         "path": "/shop/debug/session-dump",
         "attack": ["/shop/debug/session-dump", "/shop/debug/session-dump?sid={n}",
-                   "/shop/debug/session-dump?user=admin&n={n}"],
+                   # 'admin' 같은 단어는 정적 룰(160001)이 AI 룰보다 먼저 막아 AI 룰 평가가 안 됨 → 사용 금지
+                   "/shop/debug/session-dump?user=u{n}&n={n}"],
     },
     "hp_internal_report": {
         "trigger": "honeypot",

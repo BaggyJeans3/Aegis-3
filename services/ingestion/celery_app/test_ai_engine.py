@@ -96,3 +96,18 @@ def test_re2_violation_gets_feedback(monkeypatch):
     bad = _json.dumps({"rule_name": "x", "regex": r"(?=a)b"})
     rule, _, meta = _run_with(monkeypatch, [bad, GOOD])
     assert rule is not None and [e["kind"] for e in meta["errors"]] == ["re2"]
+
+
+def test_quota_error_waits_for_suggested_delay(monkeypatch):
+    slept = []
+    monkeypatch.setattr(ai_engine.time, "sleep", slept.append)
+    err = RuntimeError("429 RESOURCE_EXHAUSTED. ... Please retry in 12.5s.")
+    rule, _, meta = _run_with(monkeypatch, [err, GOOD])
+    assert rule is not None and slept == [13.5]
+    assert meta["errors"][0]["kind"] == "quota"
+
+
+def test_quota_error_with_long_delay_gives_up(monkeypatch):
+    err = RuntimeError("429 RESOURCE_EXHAUSTED. ... Please retry in 3600s.")
+    rule, chat, _ = _run_with(monkeypatch, [err, GOOD])
+    assert rule is None and len(chat.sent) == 1  # 기다리지 않고 바로 포기

@@ -7,6 +7,18 @@ import time
 
 # LLM API 오류(503·네트워크) 재시도 대기 기준(초). 시도마다 2배 (2s, 4s …)
 API_RETRY_BASE_SECONDS = float(os.environ.get("AI_API_RETRY_BASE_SECONDS", "2"))
+# 사용량 한도(429)는 응답이 알려주는 대기 시간("retry in 45s")을 따른다. 그보다 길면
+# (일일 한도 소진 등) 워커를 붙잡아 두지 않고 바로 포기한다.
+API_MAX_RETRY_WAIT_SECONDS = float(os.environ.get("AI_API_MAX_RETRY_WAIT_SECONDS", "60"))
+
+
+def _retry_wait(err, attempt):
+    """API 오류 후 재시도 전 대기(초). None = 기다려도 소용없음 → 포기."""
+    m = re.search(r"retry in ([\d.]+)s|'retryDelay': '([\d.]+)s'", str(err))
+    if m:
+        wait = float(m.group(1) or m.group(2)) + 1
+        return wait if wait <= API_MAX_RETRY_WAIT_SECONDS else None
+    return API_RETRY_BASE_SECONDS * 2 ** attempt
 
 def _get_client():
     """
@@ -73,6 +85,13 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta
     이를 차단할 수 있는 정규식(Regex)과 Coraza WAF 룰을 생성하세요.
     정규식은 Coraza 가 쓰는 Go RE2 문법만 사용하세요 (lookahead/lookbehind, 역참조 \\1, 원자 그룹, 소유 수량자, (?x) 플래그 금지).
 
+    [정규식 작성 규칙] 이 룰은 정상 사용자 요청에도 똑같이 적용되므로 공격 요청만 좁게 잡아야 합니다.
+    - 정규식은 요청 URI(경로+쿼리)에 매칭됩니다. 경로는 ^ 로 시작을 고정하고, 경로 끝도 고정하세요.
+      예: ^/shop/internal-report(?:[/?]|$)  →  /shop/internal-reports-faq, /shop/internal-report-guide 같은
+      비슷한 정상 경로에는 매칭되지 않아야 합니다.
+    - 숫자·ID·토큰처럼 요청마다 바뀌는 값은 일반화하되(\\d+ 등), 경로 이름 자체를 일부만 매칭하지 마세요.
+    - 공격의 핵심이 쿼리 파라미터(예: 비정상적인 반복 횟수)라면 그 파라미터 조건을 포함하세요.
+
     [공격 로그]
     {json.dumps(attack_log, indent=2, ensure_ascii=False)}
 
@@ -93,10 +112,15 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta
         except Exception as e:
             # API/네트워크 오류(503 과부하, DNS 등)는 모델 답변 문제가 아니므로 피드백하지 않고
             # 같은 요청을 잠시 후 재전송한다. (피드백으로 바꾸면 모델이 원래 과제를 잃는다)
-            meta["errors"].append({"kind": "api", "msg": str(e)})
-            print(f"⚠️ LLM API 오류, 같은 요청 재시도 예정: {e}")
+            quota = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            meta["errors"].append({"kind": "quota" if quota else "api", "msg": str(e)})
+            wait = _retry_wait(e, attempt)
+            if wait is None:
+                print(f"⚠️ LLM 사용량 한도, 대기 시간이 너무 길어 포기: {e}")
+                break
+            print(f"⚠️ LLM API 오류, {wait:.0f}초 뒤 같은 요청 재시도 예정: {e}")
             if attempt + 1 < max_retries:
-                time.sleep(API_RETRY_BASE_SECONDS * 2 ** attempt)
+                time.sleep(wait)
             continue
 
         try:

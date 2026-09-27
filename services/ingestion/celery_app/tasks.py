@@ -542,34 +542,11 @@ def process_security_log(self, log_data):
                     print(f"[Worker] ⚠️ Redis EXISTS 실패: {redis_err} — fail-open으로 LLM 진행")
 
             # ──────────────────────────────────────────────────────────
-            # [Aegis-3 SOAR] 작업 7 — 공격 클러스터 캐시 체크
-            # 정규화된 패턴이 5분 내 이미 처리됐으면 LLM 재호출 없이 결과 재사용
-            # Redis 장애 시 fail-open
+            # 자동 재무장 — 같은 지문으로 만든 룰이 있으면 LLM 대신 재무장
+            # 5분 클러스터 캐시보다 먼저 본다: 캐시가 살아 있어도 그 룰은 이미 TTL 로
+            # 보관됐을 수 있으므로, 장부로 룰 상태를 확인(재무장 or 이미 활성)하는 게 정확하다.
             # ──────────────────────────────────────────────────────────
             cluster_key = compute_cluster_key(raw_event)
-            try:
-                cached_rule_name = redis_client.get(cluster_key)
-                if cached_rule_name:
-                    try:
-                        redis_client.incr("aegis:stats:cluster_skipped")
-                    except Exception:
-                        pass
-                    print(f"[Worker] ♻️ 클러스터 캐시 hit ({cluster_key}) — LLM 호출 skip, 기존 룰 재사용: {cached_rule_name}")
-                    return {
-                        "status": "success",
-                        "event_id": raw_event.get("event_id"),
-                        "risk_score": risk_score,
-                        "level": detection_result.get("level"),
-                        "llm_skipped": True,
-                        "reason": "cluster_cache_hit",
-                        "cached_rule": cached_rule_name,
-                    }
-            except Exception as redis_err:
-                print(f"[Worker] ⚠️ 클러스터 캐시 조회 실패: {redis_err} — fail-open으로 LLM 진행")
-
-            # ──────────────────────────────────────────────────────────
-            # 자동 재무장 — 같은 지문으로 만든 룰이 있으면 LLM 대신 재무장
-            # ──────────────────────────────────────────────────────────
             fingerprint = cluster_key.rsplit(":", 1)[1]
             rearm = _try_auto_rearm(fingerprint)
             if rearm:
@@ -598,6 +575,32 @@ def process_security_log(self, log_data):
                     "reason": rearm["result"],
                     "rule_id": rearm["rule_id"],
                 }
+
+            # ──────────────────────────────────────────────────────────
+            # [Aegis-3 SOAR] 작업 7 — 공격 클러스터 캐시 체크
+            # 정규화된 패턴이 5분 내 이미 처리됐으면 LLM 재호출 없이 결과 재사용
+            # Redis 장애 시 fail-open
+            # ──────────────────────────────────────────────────────────
+            try:
+                cached_rule_name = redis_client.get(cluster_key)
+                if cached_rule_name:
+                    try:
+                        redis_client.incr("aegis:stats:cluster_skipped")
+                    except Exception:
+                        pass
+                    _blacklist_ip(blacklist_key, ip)  # LLM 을 건너뛰어도 고위험 IP 는 차단
+                    print(f"[Worker] ♻️ 클러스터 캐시 hit ({cluster_key}) — LLM 호출 skip, 기존 룰 재사용: {cached_rule_name}")
+                    return {
+                        "status": "success",
+                        "event_id": raw_event.get("event_id"),
+                        "risk_score": risk_score,
+                        "level": detection_result.get("level"),
+                        "llm_skipped": True,
+                        "reason": "cluster_cache_hit",
+                        "cached_rule": cached_rule_name,
+                    }
+            except Exception as redis_err:
+                print(f"[Worker] ⚠️ 클러스터 캐시 조회 실패: {redis_err} — fail-open으로 LLM 진행")
 
             # LLM 호출 (기존 로직)
             trigger = "honeypot_hit" if is_honeypot else f"risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}"

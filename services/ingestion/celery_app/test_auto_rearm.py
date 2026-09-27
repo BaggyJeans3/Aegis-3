@@ -147,3 +147,22 @@ def test_honeypot_hit_triggers_ai_rule_even_with_zero_score(env, monkeypatch):
     run(dict(event("4.4.4.4", 1), event_type="request", path="/other"))  # 0점 일반 요청은 그대로 제외
     run(dict(event("5.5.5.5", 1), event_type="waf_blocked", path="/x"))  # CRS 차단 이벤트도 제외
     assert calls["llm"] == 1
+
+
+def test_rearm_checked_even_while_cluster_cache_alive(env):
+    """5분 캐시가 살아 있어도, 룰이 이미 보관됐다면 재무장해야 한다."""
+    r, calls, _ = env
+    run(event("1.1.1.1", 1))
+    out = run(event("2.2.2.2", 2))  # 캐시를 지우지 않음
+    assert out["reason"] == "rearmed" and calls["llm"] == 1
+    assert r.exists("aegis:blacklist:2.2.2.2")
+
+
+def test_cluster_cache_hit_still_blacklists_ip(env):
+    r, calls, _ = env
+    run(event("1.1.1.1", 1))
+    for k in [k for k in r.kv if k.startswith(tasks.RULE_FP_PREFIX)]:
+        del r.kv[k]  # 장부 없음 → 5분 캐시로 LLM 생략
+    out = run(event("3.3.3.3", 3))
+    assert out["reason"] == "cluster_cache_hit" and calls["llm"] == 1
+    assert r.exists("aegis:blacklist:3.3.3.3")
