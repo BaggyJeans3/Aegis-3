@@ -19,3 +19,10 @@ __pycache__/
 # Docker
 .docker/
 soar/alert_events.jsonl
+
+# Celery Beat 스케줄 상태 파일
+celerybeat-schedule*
+
+# pytest
+.pytest_cache/
+reports/
