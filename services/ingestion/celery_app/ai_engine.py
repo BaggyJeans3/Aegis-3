@@ -3,6 +3,22 @@ from google.genai import types
 import re
 import json
 import os
+import time
+
+# LLM API 오류(503·네트워크) 재시도 대기 기준(초). 시도마다 2배 (2s, 4s …)
+API_RETRY_BASE_SECONDS = float(os.environ.get("AI_API_RETRY_BASE_SECONDS", "2"))
+# 사용량 한도(429)는 응답이 알려주는 대기 시간("retry in 45s")을 따른다. 그보다 길면
+# (일일 한도 소진 등) 워커를 붙잡아 두지 않고 바로 포기한다.
+API_MAX_RETRY_WAIT_SECONDS = float(os.environ.get("AI_API_MAX_RETRY_WAIT_SECONDS", "60"))
+
+
+def _retry_wait(err, attempt):
+    """API 오류 후 재시도 전 대기(초). None = 기다려도 소용없음 → 포기."""
+    m = re.search(r"retry in ([\d.]+)s|'retryDelay': '([\d.]+)s'", str(err))
+    if m:
+        wait = float(m.group(1) or m.group(2)) + 1
+        return wait if wait <= API_MAX_RETRY_WAIT_SECONDS else None
+    return API_RETRY_BASE_SECONDS * 2 ** attempt
 
 def _get_client():
     """
@@ -16,21 +32,65 @@ def _get_client():
     return genai.Client(api_key=api_key)
 
 
-def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> dict:
+# 실행 엔진 Coraza 는 Go regexp(RE2)로 @rx 를 컴파일한다. Python re 는 통과하지만 RE2 는
+# 거부하는 문법이 dynamic.conf 에 들어가면 nginx reload 가 계속 실패하므로 사전에 막는다.
+# ponytail: 알려진 차이만 막는 목록 방식. 놓치는 문법이 생기면 Go 헬퍼로 실제 컴파일 검사.
+_RE2_UNSUPPORTED = [
+    (re.compile(r"\(\?<?[=!]"), "lookahead/lookbehind (?= (?! (?<= (?<!)"),
+    (re.compile(r"\(\?>"), "원자 그룹 (?>"),
+    (re.compile(r"\(\?\("), "조건 분기 (?(...)"),
+    (re.compile(r"[*+?}]\+"), "소유 수량자 (++ *+ ?+)"),
+]
+
+
+def check_re2_compatible(pattern: str) -> None:
+    """Go RE2 가 거부하는 문법이면 re.error 를 던진다 (피드백 루프에서 재생성 유도)."""
+    for ch in re.findall(r"\\(.)", pattern, flags=re.S):
+        if ch in "123456789":
+            raise re.error(f"Go RE2 미지원: 역참조 \\{ch}")
+        if ch == "Z":
+            raise re.error("Go RE2 미지원: \\Z (\\z 사용)")
+
+    # 이스케이프된 문자(\( 등)는 문법이 아니므로 지우고 검사
+    stripped = re.sub(r"\\.", "_", pattern, flags=re.S)
+    for rx, name in _RE2_UNSUPPORTED:
+        if rx.search(stripped):
+            raise re.error(f"Go RE2 미지원: {name}")
+    for flags in re.findall(r"\(\?([a-zA-Z-]+)[:)]", stripped):
+        if set(flags) - set("imsU-"):
+            raise re.error(f"Go RE2 미지원 플래그: (?{flags}) — i, m, s, U 만 가능")
+    for nums in re.findall(r"\{(\d*),?(\d*)\}", stripped):
+        if any(n and int(n) > 1000 for n in nums):
+            raise re.error("Go RE2 미지원: 반복 횟수 1000 초과")
+
+
+def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3, meta: dict = None) -> dict:
     """
     AI를 호출하여 공격 로그를 분석하고 WAF 룰(정규식)을 생성합니다.
     문법 오류 시 피드백 루프를 통해 재시도합니다.
+    meta 를 넘기면 실험 로그용으로 model / attempts / errors(시도별 실패 종류) 를 채운다.
     """
+    if meta is None:
+        meta = {}
+    meta.update(model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"), attempts=0, errors=[])
     client = _get_client()
     chat = client.chats.create(
-        model="gemini-2.5-flash",
+        model=meta["model"],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
 
     # 초기 프롬프트
     prompt = f"""
     당신은 웹 보안(WAF) 전문가입니다. 다음 해킹 공격 로그를 분석하고,
-    이를 차단할 수 있는 PCRE 정규식(Regex)과 Coraza WAF 룰을 생성하세요.
+    이를 차단할 수 있는 정규식(Regex)과 Coraza WAF 룰을 생성하세요.
+    정규식은 Coraza 가 쓰는 Go RE2 문법만 사용하세요 (lookahead/lookbehind, 역참조 \\1, 원자 그룹, 소유 수량자, (?x) 플래그 금지).
+
+    [정규식 작성 규칙] 이 룰은 정상 사용자 요청에도 똑같이 적용되므로 공격 요청만 좁게 잡아야 합니다.
+    - 정규식은 요청 URI(경로+쿼리)에 매칭됩니다. 경로는 ^ 로 시작을 고정하고, 경로 끝도 고정하세요.
+      예: ^/shop/internal-report(?:[/?]|$)  →  /shop/internal-reports-faq, /shop/internal-report-guide 같은
+      비슷한 정상 경로에는 매칭되지 않아야 합니다.
+    - 숫자·ID·토큰처럼 요청마다 바뀌는 값은 일반화하되(\\d+ 등), 경로 이름 자체를 일부만 매칭하지 마세요.
+    - 공격의 핵심이 쿼리 파라미터(예: 비정상적인 반복 횟수)라면 그 파라미터 조건을 포함하세요.
 
     [공격 로그]
     {json.dumps(attack_log, indent=2, ensure_ascii=False)}
@@ -45,9 +105,25 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> d
     """
 
     for attempt in range(max_retries):
+        meta["attempts"] = attempt + 1
+        print(f"--- [시도 {attempt + 1}/{max_retries}] AI 룰 생성 중 ---")
         try:
-            print(f"--- [시도 {attempt + 1}/{max_retries}] AI 룰 생성 중 ---")
             response = chat.send_message(prompt)
+        except Exception as e:
+            # API/네트워크 오류(503 과부하, DNS 등)는 모델 답변 문제가 아니므로 피드백하지 않고
+            # 같은 요청을 잠시 후 재전송한다. (피드백으로 바꾸면 모델이 원래 과제를 잃는다)
+            quota = "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e)
+            meta["errors"].append({"kind": "quota" if quota else "api", "msg": str(e)})
+            wait = _retry_wait(e, attempt)
+            if wait is None:
+                print(f"⚠️ LLM 사용량 한도, 대기 시간이 너무 길어 포기: {e}")
+                break
+            print(f"⚠️ LLM API 오류, {wait:.0f}초 뒤 같은 요청 재시도 예정: {e}")
+            if attempt + 1 < max_retries:
+                time.sleep(wait)
+            continue
+
+        try:
             result = json.loads(response.text)
 
             # 1. JSON 구조 검증 (필요한 키가 다 있는지)
@@ -59,6 +135,8 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> d
             # 2. 정규식 문법 사전 테스트 (Try-Except의 핵심)
             # re.compile을 통해 정규식 문법이 유효한지 파이썬 내부에서 검사합니다.
             re.compile(generated_regex)
+            # 3. 실행 엔진(Coraza, Go RE2) 문법 호환 검사
+            check_re2_compatible(generated_regex)
 
             print("✅ 정규식 문법 검증 성공!")
             return result  # 성공 시 최종 결과 반환
@@ -67,16 +145,25 @@ def generate_waf_rule_with_feedback(attack_log: dict, max_retries: int = 3) -> d
             # JSON 파싱 에러 발생 시 피드백
             error_msg = f"JSON 파싱 에러가 발생했습니다: {str(e)}. 반드시 올바른 JSON 형식으로만 응답하세요."
             prompt = error_msg
+            meta["errors"].append({"kind": "json", "msg": str(e)})
 
         except re.error as e:
             # 정규식 문법 에러 발생 시 피드백
             error_msg = f"당신이 생성한 정규식 '{generated_regex}'에 문법 오류가 있습니다: {str(e)}. 이 오류를 수정하여 다시 정규식을 작성하세요."
             print(f"⚠️ 정규식 오류 발생. 피드백 전송: {error_msg}")
             prompt = error_msg
+            kind = "re2" if str(e).startswith("Go RE2") else "regex"
+            meta["errors"].append({"kind": kind, "msg": str(e)})
+
+        except ValueError as e:
+            # 필수 키 누락 등 응답 구조 오류
+            prompt = f"응답 형식 오류: {str(e)}. 앞서 요청한 출력 JSON 포맷(rule_name, description, regex, confidence_score)으로 다시 응답하세요."
+            meta["errors"].append({"kind": "schema", "msg": str(e)})
 
         except Exception as e:
             error_msg = f"알 수 없는 에러: {str(e)}. 다시 시도하세요."
             prompt = error_msg
+            meta["errors"].append({"kind": "other", "msg": str(e)})
 
     # 최대 재시도 횟수를 초과한 경우
     print("❌ 최대 재시도 횟수 초과. AI 룰 생성 실패.")

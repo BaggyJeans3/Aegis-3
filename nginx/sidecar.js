@@ -51,6 +51,9 @@ const BLOCK_SIGNAL_RULE_IDS = (process.env.BLOCK_SIGNAL_RULE_IDS || '949110,9591
 // proxy/worker 와 동일한 큐. worker(consume_logs_from_redis_queue)가 RPOP 해서 저장한다.
 const SECURITY_EVENT_QUEUE =
   process.env.SECURITY_EVENT_QUEUE || 'aegis:security-events'
+// AI 룰 생애주기 이벤트 큐(오탐율/탐지율 실험 로그). worker 가 MongoDB ai_rule_events 로 적재.
+const AI_RULE_EVENT_QUEUE =
+  process.env.AI_RULE_EVENT_QUEUE || 'aegis:ai-rule-events'
 
 // Shadow 판정 B(IP 평판)용 Redis. 연결 실패해도 핵심기능은 계속(fail-open: B 생략=C만).
 const REDIS_HOST = process.env.REDIS_HOST || 'redis'
@@ -73,6 +76,15 @@ redisClient.connect().catch((err) => {
     `[Sidecar] Redis 연결 실패: ${err.message} — Shadow 판정은 C(CRS 교차검증)만 사용`,
   )
 })
+
+// AI 룰 이벤트 1건 적재. Redis 미연결 시 버림(fail-open, 룰 동작에는 영향 없음).
+function logRuleEvent(type, data) {
+  if (!redisReady) return
+  const event = { type, source: 'sidecar', ts: new Date().toISOString(), ...data }
+  redisClient
+    .lPush(AI_RULE_EVENT_QUEUE, JSON.stringify(event))
+    .catch((err) => console.warn(`[RuleLog] ${type} 적재 실패: ${err.message}`))
+}
 
 // Shadow Mode 중인 룰들
 const shadowRules = new Map() // rule_id → { startedAt, ruleText, expiresAt }
@@ -170,6 +182,7 @@ app.post('/api/v1/rules/inject', (req, res) => {
   })
   shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
   console.log(`[Shadow] injected ${ruleId} (will judge in ${SHADOW_DURATION}s)`)
+  logRuleEvent('shadow_injected', { rule_id: ruleId, rule: shadowRule })
 
   // 5. nginx reload (배치). 룰은 파일+메모리에 이미 반영됨, 적용만 합산 지연.
   scheduleReload()
@@ -255,6 +268,7 @@ app.post('/api/v1/rules/rearm/:id', (req, res) => {
   console.log(
     `[Re-arm] ${ruleId} restored from archive (was ${archived.reason}) → shadow`,
   )
+  logRuleEvent('rearmed', { rule_id: ruleId, prev_reason: archived.reason })
 
   scheduleReload()
   return res.json({ status: 'rearmed_shadow', rule_id: ruleId, reload: 'queued' })
@@ -374,14 +388,27 @@ async function isIpBlacklisted(ip) {
   }
 }
 
+// 이벤트 로그용 요청 식별 정보 (정답 라벨링은 분석 시 ip/경로로 한다)
+function txnInfo(txn) {
+  return { ip: txn.ip, method: txn.method, host: txn.host, path: txn.path, query: txn.query }
+}
+
 // shadow 룰 매칭 1건을 공격/오탐으로 분류해 통계 누적
-async function classifyShadowMatch(ruleId, crsCorroborated, ip) {
+async function classifyShadowMatch(ruleId, crsCorroborated, txn) {
   const stats = shadowStats.get(ruleId)
   if (!stats) return
   stats.total += 1
 
   // C(CRS 동시매칭) 또는 B(공격자 IP) 중 하나면 '공격 확정'
+  const ip = txn.ip
   const ipBad = crsCorroborated ? false : await isIpBlacklisted(ip)
+  logRuleEvent('shadow_match', {
+    rule_id: ruleId,
+    verdict: crsCorroborated || ipBad ? 'attack' : 'normal_est', // 정상 추정 표본
+    crs_corroborated: crsCorroborated,
+    ip_blacklisted: ipBad,
+    ...txnInfo(txn),
+  })
   if (crsCorroborated || ipBad) {
     stats.attack += 1
     console.log(
@@ -472,7 +499,14 @@ function finalizeTransaction(txn) {
   const crsCorroborated = ids.some(isCorroboratingRule)
   for (const id of ids) {
     if (shadowRules.has(id)) {
-      classifyShadowMatch(id, crsCorroborated, txn.ip)
+      classifyShadowMatch(id, crsCorroborated, txn)
+    } else if (liveRules.has(id)) {
+      // 승격된(deny) AI 룰의 실제 차단 1건 — 탐지율/실오탐 산출용
+      logRuleEvent('live_match', {
+        rule_id: id,
+        crs_corroborated: crsCorroborated,
+        ...txnInfo(txn),
+      })
     }
   }
 
@@ -538,7 +572,8 @@ function startLogWatcher() {
     // B(요청) 파트: 요청라인(METHOD URI HTTP/x)과 Host 헤더 캡처 → 차단 로그용
     if (partB) {
       if (expectReqLine && line.trim()) {
-        const rl = line.trim().match(/^([A-Z]+)\s+(\S+)\s+HTTP\//)
+        // Coraza native 는 "GET /p?q 1.1" 처럼 'HTTP/' 없이 기록한다 → 둘 다 허용
+        const rl = line.trim().match(/^([A-Z]+)\s+(\S+)\s+(?:HTTP\/)?\d/)
         if (rl) {
           txn.method = rl[1]
           const uri = rl[2]
@@ -563,6 +598,7 @@ function startLogWatcher() {
   })
 }
 
+restoreStateFromFiles()
 startLogWatcher()
 console.log(`[Scheduler] shadow expiration check every 10s`)
 console.log(
@@ -741,6 +777,12 @@ function promoteRule(ruleId) {
       expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
     })
 
+    logRuleEvent('promoted', { rule_id: ruleId, ...shadowSummary(ruleId, now) })
+    // 관찰 상태에서 내림. (수동 promote API 로 올린 룰이 shadow 에 남아 관찰 판정을
+    //  계속 받다가 undersampled 로 보관되던 버그 방지)
+    shadowRules.delete(ruleId)
+    shadowStats.delete(ruleId)
+
     // nginx reload (배치)
     console.log(`[Promote] ${ruleId} promoted to deny (reload queued)`)
     scheduleReload()
@@ -748,6 +790,16 @@ function promoteRule(ruleId) {
   } catch (err) {
     console.error(`[Promote] error for ${ruleId}:`, err.message)
     return false
+  }
+}
+
+// 승격/보관 판정 시점의 관찰 통계 (이벤트 로그용). shadow 가 아니면 stats=null.
+function shadowSummary(ruleId, now) {
+  const info = shadowRules.get(ruleId)
+  return {
+    from: shadowRules.has(ruleId) ? 'shadow' : liveRules.has(ruleId) ? 'live' : 'unknown',
+    stats: shadowStats.get(ruleId) || null, // { total, attack, fp(=정상 추정) }
+    observed_s: info ? Math.floor((now - info.startedAt) / 1000) : null,
   }
 }
 
@@ -764,6 +816,60 @@ function archiveRule(ruleId, ruleText, reason) {
   } catch (err) {
     console.error(`[Archive] write failed for ${ruleId}:`, err.message)
   }
+}
+
+// 사이드카 재시작 시 메모리 상태 복구. 파일(dynamic.conf·archived.conf)이 원본이다.
+// 관찰/TTL 시계는 재시작 시점부터 다시 센다(관찰 룰은 처음부터 재관찰, 라이브 룰은 TTL 갱신).
+function restoreStateFromFiles() {
+  const now = Date.now()
+  const readLines = (file) => {
+    try {
+      return fs.readFileSync(file, 'utf8').split('\n')
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error(`[Restore] ${file} read failed:`, err.message)
+      return []
+    }
+  }
+
+  // archived.conf: "# archived id=<id> reason=<r> at=<iso>" 다음 줄이 룰 원문. 같은 id 는 마지막 기록이 유효.
+  const archLines = readLines(RULE_ARCHIVE_FILE)
+  archLines.forEach((line, i) => {
+    const m = line.match(/^# archived id=(\d+) reason=(\S+) at=(\S+)/)
+    if (!m) return
+    archivedRules.set(parseInt(m[1], 10), {
+      ruleText: archLines[i + 1] || '',
+      reason: m[2],
+      archivedAt: Date.parse(m[3]) || now,
+    })
+  })
+
+  let shadow = 0
+  let live = 0
+  for (const line of readLines(rulePath)) {
+    const m = line.match(/id:(\d+)/)
+    if (!m || line.trim().startsWith('#')) continue
+    const ruleId = parseInt(m[1], 10)
+    archivedRules.delete(ruleId) // 보관 후 재무장·재주입된 룰은 활성 상태가 우선
+    if (/\bdeny\b/.test(line)) {
+      liveRules.set(ruleId, {
+        promotedAt: now,
+        lastMatchedAt: now,
+        expiresAt: now + MAX_RULE_AGE_SECONDS * 1000,
+      })
+      live++
+    } else {
+      shadowRules.set(ruleId, {
+        startedAt: now,
+        ruleText: line,
+        expiresAt: now + TTL_SECONDS * 1000,
+      })
+      shadowStats.set(ruleId, { total: 0, attack: 0, fp: 0 })
+      shadow++
+    }
+  }
+  console.log(
+    `[Restore] 파일에서 상태 복구: shadow=${shadow}, live=${live}, archived=${archivedRules.size}`,
+  )
 }
 
 // 룰을 활성 룰 파일(dynamic.conf)에서 내린다. 단, 삭제하지 않고 보관(archive)하여
@@ -786,6 +892,7 @@ function revokeRule(ruleId, reason = 'manual') {
 
     // 물리 삭제 대신 보관: 폐기 근거(reason) 추적 + 재공격 시 재무장 가능
     archiveRule(ruleId, removed.join('\n'), reason)
+    logRuleEvent('archived', { rule_id: ruleId, reason, ...shadowSummary(ruleId, Date.now()) })
 
     fs.writeFileSync(rulePath, newLines.join('\n'))
 

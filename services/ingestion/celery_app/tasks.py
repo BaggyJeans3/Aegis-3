@@ -38,6 +38,11 @@ MONGO_URI = os.getenv(
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "aegis_logs")
 MONGO_COLLECTION_NAME = os.getenv("MONGO_COLLECTION_NAME", "security_logs")
 
+# AI 룰 생애주기 이벤트(생성·관찰 매칭·승격·보관·재무장) — 오탐율/탐지율 실험 로그
+# worker 는 생성 이벤트를 직접 저장하고, sidecar 는 이 큐에 LPUSH → consume 태스크가 적재.
+AI_RULE_EVENT_QUEUE = os.getenv("AI_RULE_EVENT_QUEUE", "aegis:ai-rule-events")
+AI_RULE_EVENTS_COLLECTION = os.getenv("AI_RULE_EVENTS_COLLECTION", "ai_rule_events")
+
 # AI 룰 생성 임계값 및 Nginx 사이드카(룰 주입) 엔드포인트
 AI_RULE_THRESHOLD = int(os.getenv("AI_RULE_THRESHOLD", "80"))
 NGINX_SIDECAR_URL = os.getenv(
@@ -221,13 +226,49 @@ def _build_mongo_uri():
     return MONGO_URI
 
 
-def get_mongo_collection():
+def get_mongo_collection(name=None):
     """
-    MongoDB collection 객체를 반환한다.
+    MongoDB collection 객체를 반환한다. name 미지정 시 보안 로그 컬렉션.
     """
     client = MongoClient(_build_mongo_uri())
     db = client[MONGO_DB_NAME]
-    return db[MONGO_COLLECTION_NAME]
+    return db[name or MONGO_COLLECTION_NAME]
+
+
+def _log_ai_rule_event(event: dict) -> None:
+    """AI 룰 실험 로그 1건 저장. 실패해도 본 파이프라인에는 영향 없음."""
+    event.setdefault("ts", datetime.utcnow().isoformat() + "Z")
+    event.setdefault("source", "worker")
+    try:
+        get_mongo_collection(AI_RULE_EVENTS_COLLECTION).insert_one(event)
+    except Exception as log_err:
+        print(f"[Worker] ⚠️ AI 룰 이벤트 저장 실패(무시): {log_err}")
+
+
+def drain_ai_rule_events(batch_size: int = 500) -> int:
+    """sidecar 가 큐에 쌓은 AI 룰 이벤트를 MongoDB 로 옮긴다. 저장 실패 시 큐로 되돌림."""
+    raws = []
+    while len(raws) < batch_size:
+        raw = redis_client.rpop(AI_RULE_EVENT_QUEUE)
+        if not raw:
+            break
+        raws.append(raw)
+    docs = []
+    for r in raws:
+        try:
+            docs.append(json.loads(r))
+        except ValueError:
+            print(f"[Worker] ⚠️ 깨진 AI 룰 이벤트 버림: {r[:200]}")
+    if not docs:
+        return 0
+    try:
+        get_mongo_collection(AI_RULE_EVENTS_COLLECTION).insert_many(docs)
+    except Exception as mongo_err:
+        # RPOP 한 쪽(꼬리)으로 되돌려 다음 주기에 재시도
+        redis_client.rpush(AI_RULE_EVENT_QUEUE, *[json.dumps(d) for d in reversed(docs)])
+        print(f"[Worker] ⚠️ AI 룰 이벤트 적재 실패, 큐로 복원: {mongo_err}")
+        return 0
+    return len(docs)
 
 
 def build_mongo_document(raw_event, analyzer_result):
@@ -310,8 +351,8 @@ def _build_coraza_rule(rule: dict) -> str:
     )
 
 
-def _inject_rule_to_nginx(rule: dict) -> None:
-    """생성된 WAF 룰을 Nginx 사이드카로 전송"""
+def _inject_rule_to_nginx(rule: dict):
+    """생성된 WAF 룰을 Nginx 사이드카로 전송. 성공 시 rule_id, 실패 시 None."""
     try:
         rule_str = _build_coraza_rule(rule)
         resp = requests.post(
@@ -320,8 +361,68 @@ def _inject_rule_to_nginx(rule: dict) -> None:
             timeout=5,
         )
         print(f"[Worker] WAF 룰 주입 응답: {resp.status_code} - {resp.text[:200]}")
+        if resp.ok:
+            return int(re.search(r"id:(\d+)", rule_str).group(1))
     except Exception as inj_err:
         print(f"[Error] Nginx 사이드카 룰 주입 실패: {inj_err}")
+    return None
+
+
+# ============================================================
+# 자동 재무장 — 공격 지문(정규화 패턴 해시, compute_cluster_key 와 동일) → 그 공격으로
+# 만든 rule_id 장부. 같은 지문의 공격이 다시 오면 LLM 대신 보관된 룰을 재무장한다.
+# 재무장된 룰은 shadow(관찰)로 돌아가 재검증부터 받는다.
+# ============================================================
+
+RULE_FP_PREFIX = "aegis:rule-fp:"
+RULE_FP_TTL_SECONDS = int(os.getenv("RULE_FP_TTL_SECONDS", str(30 * 86400)))  # 30일
+
+
+def _remember_rule_fingerprint(fingerprint: str, rule_id: int) -> None:
+    try:
+        redis_client.setex(RULE_FP_PREFIX + fingerprint, RULE_FP_TTL_SECONDS, rule_id)
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 룰 지문 장부 저장 실패: {redis_err}")
+
+
+def _try_auto_rearm(fingerprint: str):
+    """
+    장부에 룰이 있으면 사이드카 재무장 호출.
+    - 200 rearmed: 보관본을 shadow 로 되살림
+    - 409 already_active: 룰이 이미 관찰/차단 중 → 새 룰 불필요
+    그 외(장부 없음, 보관본 없음 404, Redis/사이드카 장애) → None = 기존대로 LLM 진행.
+    """
+    try:
+        rule_id = redis_client.get(RULE_FP_PREFIX + fingerprint)
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 룰 지문 장부 조회 실패: {redis_err} — LLM 진행")
+        return None
+    if not rule_id:
+        return None
+
+    rearm_url = NGINX_SIDECAR_URL.rsplit("/", 1)[0] + f"/rearm/{rule_id}"
+    try:
+        resp = requests.post(rearm_url, timeout=5)
+    except Exception as req_err:
+        print(f"[Worker] ⚠️ 재무장 호출 실패: {req_err} — LLM 진행")
+        return None
+    print(f"[Worker] 재무장 응답(rule {rule_id}): {resp.status_code} - {resp.text[:200]}")
+    if resp.status_code == 200:
+        return {"result": "rearmed", "rule_id": int(rule_id)}
+    if resp.status_code == 409:
+        return {"result": "already_active", "rule_id": int(rule_id)}
+    return None
+
+
+def _blacklist_ip(blacklist_key, ip) -> None:
+    """고위험 IP 24h 블랙리스트 — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊는다."""
+    if not blacklist_key:
+        return
+    try:
+        redis_client.setex(blacklist_key, 86400, "1")
+        print(f"[Worker] 🔒 IP {ip} blacklist 등록 (TTL 24h)")
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
 
 
 def _report_to_analyzer(ip: str, attack_type: str) -> None:
@@ -397,7 +498,11 @@ def process_security_log(self, log_data):
         # ------------------------------------------------------------
         detection_result = analyzer_result.get("detection_result", {})
         risk_score = int(detection_result.get("risk_score") or 0)
-        if risk_score >= AI_RULE_THRESHOLD:
+        # 허니팟 접근은 정상 사용자가 올 일 없는 확정 공격 신호인데 detector 는 점수를 주지 않는다.
+        # → 점수와 무관하게 AI 룰 생성 대상. (waf_blocked 는 제외: CRS 가 이미 막는 공격이라
+        #    뒤에 서는 AI 룰은 매칭될 기회가 없음)
+        is_honeypot = str(raw_event.get("event_type") or "").lower() == "honeypot_hit"
+        if risk_score >= AI_RULE_THRESHOLD or is_honeypot:
             # ──────────────────────────────────────────────────────────
             # [Aegis-3 SOAR] IP 평판 — 작업 6-A
             # LLM 호출 전 블랙리스트 체크: 24시간 내 이미 악성 판정된 IP면
@@ -437,11 +542,45 @@ def process_security_log(self, log_data):
                     print(f"[Worker] ⚠️ Redis EXISTS 실패: {redis_err} — fail-open으로 LLM 진행")
 
             # ──────────────────────────────────────────────────────────
+            # 자동 재무장 — 같은 지문으로 만든 룰이 있으면 LLM 대신 재무장
+            # 5분 클러스터 캐시보다 먼저 본다: 캐시가 살아 있어도 그 룰은 이미 TTL 로
+            # 보관됐을 수 있으므로, 장부로 룰 상태를 확인(재무장 or 이미 활성)하는 게 정확하다.
+            # ──────────────────────────────────────────────────────────
+            cluster_key = compute_cluster_key(raw_event)
+            fingerprint = cluster_key.rsplit(":", 1)[1]
+            rearm = _try_auto_rearm(fingerprint)
+            if rearm:
+                _blacklist_ip(blacklist_key, ip)
+                try:
+                    redis_client.incr("aegis:stats:rearm_skipped")
+                except Exception:
+                    pass
+                print(f"[Worker] 🔁 자동 재무장 ({rearm['result']}, rule {rearm['rule_id']}) — LLM 호출 skip")
+                _log_ai_rule_event({
+                    "type": "auto_rearm",
+                    **rearm,  # result, rule_id
+                    "fingerprint": fingerprint,
+                    "event_id": raw_event.get("event_id"),
+                    "ip": ip,
+                    "method": raw_event.get("method"),
+                    "path": raw_event.get("path"),
+                    "risk_score": risk_score,
+                })
+                return {
+                    "status": "success",
+                    "event_id": raw_event.get("event_id"),
+                    "risk_score": risk_score,
+                    "level": detection_result.get("level"),
+                    "llm_skipped": True,
+                    "reason": rearm["result"],
+                    "rule_id": rearm["rule_id"],
+                }
+
+            # ──────────────────────────────────────────────────────────
             # [Aegis-3 SOAR] 작업 7 — 공격 클러스터 캐시 체크
             # 정규화된 패턴이 5분 내 이미 처리됐으면 LLM 재호출 없이 결과 재사용
             # Redis 장애 시 fail-open
             # ──────────────────────────────────────────────────────────
-            cluster_key = compute_cluster_key(raw_event)
             try:
                 cached_rule_name = redis_client.get(cluster_key)
                 if cached_rule_name:
@@ -449,6 +588,7 @@ def process_security_log(self, log_data):
                         redis_client.incr("aegis:stats:cluster_skipped")
                     except Exception:
                         pass
+                    _blacklist_ip(blacklist_key, ip)  # LLM 을 건너뛰어도 고위험 IP 는 차단
                     print(f"[Worker] ♻️ 클러스터 캐시 hit ({cluster_key}) — LLM 호출 skip, 기존 룰 재사용: {cached_rule_name}")
                     return {
                         "status": "success",
@@ -463,8 +603,12 @@ def process_security_log(self, log_data):
                 print(f"[Worker] ⚠️ 클러스터 캐시 조회 실패: {redis_err} — fail-open으로 LLM 진행")
 
             # LLM 호출 (기존 로직)
-            print(f"[Worker] 🧠 risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}, AI 룰 생성 시작")
-            ai_rule = generate_waf_rule_with_feedback(raw_event)
+            trigger = "honeypot_hit" if is_honeypot else f"risk_score={risk_score} ≥ {AI_RULE_THRESHOLD}"
+            print(f"[Worker] 🧠 {trigger}, AI 룰 생성 시작")
+            gen_meta = {}
+            t0 = time.time()
+            ai_rule = generate_waf_rule_with_feedback(raw_event, meta=gen_meta)
+            llm_latency_ms = int((time.time() - t0) * 1000)
 
             # ──────────────────────────────────────────────────────────
             # [Aegis-3 SOAR] 작업 7 — 클러스터 캐시 저장
@@ -478,19 +622,32 @@ def process_security_log(self, log_data):
                     print(f"[Worker] ⚠️ 클러스터 캐시 저장 실패: {redis_err}")
 
             # LLM 호출 후 IP를 24h 블랙리스트 등록 (성공/실패 모두)
-            # — Proxy 1차 차단 미들웨어가 다음 요청을 즉시 끊을 수 있도록
-            if blacklist_key:
-                try:
-                    redis_client.setex(blacklist_key, 86400, "1")
-                    print(f"[Worker] 🔒 IP {ip} blacklist 등록 (TTL 24h)")
-                except Exception as redis_err:
-                    print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
+            _blacklist_ip(blacklist_key, ip)
 
+            rule_id = None
             if ai_rule and ai_rule.get("regex"):
                 print(f"[Worker] ✅ AI 룰 생성됨: {ai_rule.get('rule_name')} (confidence={ai_rule.get('confidence_score')})")
-                _inject_rule_to_nginx(ai_rule)
+                rule_id = _inject_rule_to_nginx(ai_rule)
+                if rule_id:
+                    _remember_rule_fingerprint(fingerprint, rule_id)
             else:
                 print(f"[Worker] ⚠️ AI 룰 생성 실패(반환 None) — 주입 건너뜀")
+
+            _log_ai_rule_event({
+                "type": "generated" if ai_rule else "generation_failed",
+                "rule_id": rule_id,  # sidecar 이벤트와 조인 키. 주입 실패 시 None
+                "rule_name": (ai_rule or {}).get("rule_name"),
+                "regex": (ai_rule or {}).get("regex"),
+                "confidence_score": (ai_rule or {}).get("confidence_score"),
+                "llm_latency_ms": llm_latency_ms,
+                **gen_meta,  # model, attempts, errors
+                "fingerprint": fingerprint,
+                "event_id": raw_event.get("event_id"),
+                "ip": ip,
+                "method": raw_event.get("method"),
+                "path": raw_event.get("path"),
+                "risk_score": risk_score,
+            })
 
         print("[Worker] 로그 처리 완료")
 
@@ -532,6 +689,11 @@ def consume_logs_from_redis_queue():
 
         process_security_log.delay(log_raw)
         logs_processed += 1
+
+    try:
+        drain_ai_rule_events()
+    except Exception as drain_err:
+        print(f"[Worker] ⚠️ AI 룰 이벤트 drain 실패(무시): {drain_err}")
 
     message = f"{logs_processed}개의 로그를 Redis 큐에서 꺼내 처리 작업에 할당했습니다."
     print(f"[Worker] {message}")

@@ -5,4 +5,4 @@ redis
 pydantic
 requests
 pymongo
-google-genai
+google-genai==2.25.0
