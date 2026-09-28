@@ -53,7 +53,7 @@ jobs:
         run: python -m pytest services/ingestion/celery_app/tests -q --junitxml=reports/worker.xml
       - name: 테스트 리포트 업로드
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: soar-test-reports
           path: reports/
