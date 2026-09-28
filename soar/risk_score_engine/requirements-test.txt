@@ -1,5 +1,5 @@
 # CI / 로컬 테스트용 (운영 이미지에는 포함되지 않음)
-pytest>=8
+pytest>=9.1.1
 flask>=3
 celery>=5.3
 redis>=5
