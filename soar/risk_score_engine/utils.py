@@ -23,6 +23,18 @@ def parse_time(timestamp):
         return datetime.now()
 
 
+def safe_int(value, default=0):
+    """
+    status_code 등을 안전하게 정수로 변환한다.
+    [수정] 이벤트에 "status_code": null 이나 "abc" 가 오면 int() 가 예외를 던져
+    /analyze 가 500 → worker 가 재시도 3회 후 이벤트를 버리는 문제가 있었다.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def remove_old_time_events(event_queue, current_time, window_seconds):
     """
     시간만 저장된 deque에서 window_seconds보다 오래된 기록 제거
@@ -70,15 +82,36 @@ def is_match_any(patterns, text):
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
+# 인프라(프록시 체인)가 채우는 IP 헤더. 공격 payload 가 아니므로 payload 탐지 대상에서 제외한다.
+# [수정] nginx 2-pass 구조(:80 → 127.0.0.1:8081 → proxy)에서 X-Forwarded-For 는 항상
+#   "<client>, 127.0.0.1" 이 되고, 로컬/도커 환경에선 172.x·10.x 가 들어간다.
+#   이 값이 SSRF_PATTERNS(127.0.0.1, 사설대역)에 매칭돼 full 분석 이벤트 전부에
+#   R-PAYLOAD-002(+60) 오탐이 붙던 문제를 막는다.
+INFRA_IP_HEADERS = {
+    "x-forwarded-for",
+    "x-real-ip",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "forwarded",
+}
+
+
 def get_request_text(log):
     """
     Payload 탐지를 위해 path, query, body, headers를 하나의 문자열로 합친다.
     Proxy Redis 이벤트에 query/body/headers가 들어오도록 맞춰둔다.
+    단, 프록시 체인이 붙이는 IP 헤더(INFRA_IP_HEADERS)는 제외한다.
     """
     path = str(log.get("path", ""))
     query = str(log.get("query", ""))
     body = str(log.get("body", ""))
-    headers = json.dumps(log.get("headers", {}), ensure_ascii=False)
+    raw_headers = log.get("headers") or {}
+    if isinstance(raw_headers, dict):
+        raw_headers = {
+            k: v for k, v in raw_headers.items()
+            if str(k).lower() not in INFRA_IP_HEADERS
+        }
+    headers = json.dumps(raw_headers, ensure_ascii=False)
 
     return f"{path} {query} {body} {headers}"
 

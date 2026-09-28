@@ -12,6 +12,16 @@
  * 실행 예:
  *   k6 run -e TARGET=http://localhost -e SCENARIO=normal aegis3_load_test.js
  *
+ * [SOAR 주의 — 실행 전 확인]
+ *   - soar-worker 의 AI_RULE_THRESHOLD 가 운영값(80)인지 확인할 것. 시연값(30, demo_setup.sh)이면
+ *     단일 IP 요청량 룰(R-RATE-001 = 30점)만으로 수 초 내 SOAR 대응이 트리거되어
+ *     k6 IP 블랙리스트(이후 proxy 403) + Cloudflare 차단 + Slack/Email 이 이벤트마다 발송된다.
+ *       확인: sudo docker exec aegis-soar-worker printenv AI_RULE_THRESHOLD
+ *   - 기본 실행은 모든 VU 가 같은 IP → 정상 트래픽도 R-RATE-002(50점, HIGH)로 대시보드에 찍힌다(정상 동작).
+ *     '다수의 정상 사용자' 부하를 재려면 -e SPREAD_IPS=1024 로 정상 요청의 X-Forwarded-For 를 분산한다.
+ *     (벤치마크 전용 대역 198.18.0.0/15 사용)
+ *   - SOAR 쪽 사전 점검: python3 scripts/soar_bench/k6_threshold_sim.py [--spread-ips 1024]
+ *
  * Docker로 실행 (k6 설치 불필요):
  *   docker run --rm -i --network host \
  *     -e TARGET=http://localhost -e SCENARIO=normal \
@@ -27,6 +37,13 @@ import { Counter, Trend, Rate } from 'k6/metrics';
 // ---------------------------------------------------------
 const TARGET = __ENV.TARGET || 'http://localhost';
 const SCENARIO = __ENV.SCENARIO || 'normal';
+// 0 이면 기존 동작(단일 IP). N>0 이면 정상 요청에 X-Forwarded-For: 198.18.x.y (N개 중 하나) 부여
+const SPREAD_IPS = parseInt(__ENV.SPREAD_IPS || '0', 10);
+
+function spreadIp() {
+  const n = Math.floor(Math.random() * SPREAD_IPS);
+  return `198.18.${Math.floor(n / 256)}.${n % 256}`;
+}
 
 // 커스텀 메트릭
 const blockedRequests = new Counter('aegis_blocked_requests');   // 403 차단 수
@@ -145,7 +162,11 @@ export default function() {
     }
   }
 
-  const params = { headers: req.headers, timeout: '10s' };
+  const headers = Object.assign({}, req.headers);
+  if (SPREAD_IPS > 0 && !isAttack) {
+    headers['X-Forwarded-For'] = spreadIp();
+  }
+  const params = { headers, timeout: '10s' };
   const url = `${TARGET}${req.path}`;
 
   const res = req.method === 'POST'

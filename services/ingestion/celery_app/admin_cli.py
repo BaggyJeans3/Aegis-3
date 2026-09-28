@@ -63,6 +63,7 @@ def stats() -> None:
         ("aegis:stats:proxy_blocked", "Proxy 1차 차단 횟수"),
         ("aegis:stats:llm_skipped", "LLM 호출 skip 횟수 (blacklist)"),
         ("aegis:stats:cluster_skipped", "LLM 호출 skip 횟수 (cluster)"),
+        ("aegis:stats:report_suppressed", "analyzer 보고 생략 횟수 (IP 쿨다운)"),
         ("aegis:stats:false_positive_total", "오탐지 의심 누적"),
     ]
     print("📈 Aegis-3 SOAR 통계:")

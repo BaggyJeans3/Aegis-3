@@ -12,6 +12,8 @@ from ai_engine import generate_waf_rule_with_feedback
 import re
 import hashlib
 
+from redis import exceptions as redis_errors
+
 
 # ============================================================
 # Worker 설정
@@ -63,6 +65,16 @@ ANALYZER_REPORT_URL = os.getenv(
 # ============================================================
 
 CLUSTER_TTL_SECONDS = int(os.getenv("CLUSTER_TTL_SECONDS", "300"))  # 5분
+
+# [처리량] Beat 1회(기본 2초)에 Redis 큐에서 꺼낼 최대 이벤트 수.
+# 기존 100 고정 → 2초당 100건 = 최대 50 eps 로 소비가 묶여 k6 부하(수백 RPS)에서 큐가 계속 적체됐다.
+CONSUME_BATCH_SIZE = int(os.getenv("CONSUME_BATCH_SIZE", "1000"))
+
+# [알림 폭주 방지] 같은 IP 에 대한 analyzer 보고(CF 차단 + Slack + Email)는 쿨다운 동안 1회만.
+# 기존: 고위험 이벤트마다 보고 → 한 IP 가 초당 수백 건(k6, 실제 스캐너)을 보내면
+#       Slack/Email/Cloudflare API 가 이벤트 수만큼 호출됨 (k6 시뮬레이션: 최대 3만 회).
+# 0 으로 두면 기존 동작(매 이벤트 보고).
+REPORT_COOLDOWN_SECONDS = int(os.getenv("REPORT_COOLDOWN_SECONDS", "600"))
 FP_THRESHOLD = int(os.getenv("FP_THRESHOLD", "3"))  # 오탐지 의심 임계값
 
 
@@ -226,12 +238,28 @@ def _build_mongo_uri():
     return MONGO_URI
 
 
+# [처리량/안정성] 프로세스(prefork child)당 MongoClient 1개를 재사용한다.
+# 기존: 태스크마다 MongoClient 를 새로 만들고 닫지 않음 → 이벤트마다 TCP 연결 + SCRAM 인증 +
+#       백그라운드 모니터 스레드가 새로 생기고, GC 전까지 연결이 남아 Mongo 연결 수가 계속 늘었다.
+# fork 이후 첫 호출 시점에 생성하고 PID 로 구분해, 부모에서 만든 클라이언트를 자식이 물려받지 않게 한다.
+_mongo_client = None
+_mongo_client_pid = None
+
+
+def _get_mongo_client():
+    global _mongo_client, _mongo_client_pid
+    pid = os.getpid()
+    if _mongo_client is None or _mongo_client_pid != pid:
+        _mongo_client = MongoClient(_build_mongo_uri())
+        _mongo_client_pid = pid
+    return _mongo_client
+
+
 def get_mongo_collection(name=None):
     """
-    MongoDB collection 객체를 반환한다. name 미지정 시 보안 로그 컬렉션.
+    MongoDB collection 객체를 반환한다. name 미지정 시 보안 로그 컬렉션. (프로세스당 클라이언트 재사용)
     """
-    client = MongoClient(_build_mongo_uri())
-    db = client[MONGO_DB_NAME]
+    db = _get_mongo_client()[MONGO_DB_NAME]
     return db[name or MONGO_COLLECTION_NAME]
 
 
@@ -269,6 +297,20 @@ def drain_ai_rule_events(batch_size: int = 500) -> int:
         print(f"[Worker] ⚠️ AI 룰 이벤트 적재 실패, 큐로 복원: {mongo_err}")
         return 0
     return len(docs)
+
+
+# [처리량] detection-engine 호출용 HTTP 세션 재사용 (keep-alive). 프로세스당 1개.
+_http_session = None
+_http_session_pid = None
+
+
+def _get_http_session():
+    global _http_session, _http_session_pid
+    pid = os.getpid()
+    if _http_session is None or _http_session_pid != pid:
+        _http_session = requests.Session()
+        _http_session_pid = pid
+    return _http_session
 
 
 def build_mongo_document(raw_event, analyzer_result):
@@ -425,6 +467,26 @@ def _blacklist_ip(blacklist_key, ip) -> None:
         print(f"[Worker] ⚠️ Redis SETEX 실패: {redis_err}")
 
 
+def _should_report(ip: str) -> bool:
+    """
+    쿨다운 안에 이미 보고한 IP 면 False. Redis SET NX EX 로 원자적으로 판정한다.
+    Redis 장애 시 fail-open(보고한다) — 알림 누락보다 중복이 낫다.
+    """
+    if REPORT_COOLDOWN_SECONDS <= 0 or not ip or ip == "unknown":
+        return True
+    try:
+        first = redis_client.set(f"aegis:reported:{ip}", "1", nx=True, ex=REPORT_COOLDOWN_SECONDS)
+        if not first:
+            try:
+                redis_client.incr("aegis:stats:report_suppressed")
+            except Exception:
+                pass
+        return bool(first)
+    except Exception as redis_err:
+        print(f"[Worker] ⚠️ 보고 쿨다운 확인 실패: {redis_err} — fail-open 으로 보고")
+        return True
+
+
 def _report_to_analyzer(ip: str, attack_type: str) -> None:
     """
     고위험 이벤트를 analyzer(/api/v1/report)로 보고.
@@ -442,7 +504,7 @@ def _report_to_analyzer(ip: str, attack_type: str) -> None:
         print(f"[Error] analyzer 보고 실패(무시): {rep_err}")
 
 
-@celery_app.task(bind=True, max_retries=3)
+@celery_app.task(bind=True, max_retries=3, ignore_result=True)
 def process_security_log(self, log_data):
     """
     Redis에서 꺼낸 단일 이벤트 로그를 처리하는 Task.
@@ -452,13 +514,15 @@ def process_security_log(self, log_data):
     """
     try:
         raw_event = normalize_redis_log(log_data)
-        print(f"[Worker] Redis 이벤트 처리 시작: {raw_event}")
+        # [처리량] 이벤트 전문 출력은 부하 시 로그 I/O 가 병목이 된다 → 요약만 출력
+        print(f"[Worker] Redis 이벤트 처리 시작: {raw_event.get('event_id')} "
+              f"{raw_event.get('event_type')} {raw_event.get('method')} {raw_event.get('path')}")
 
         # ------------------------------------------------------------
         # 1. Risk Score Engine으로 분석 요청
         # ------------------------------------------------------------
         try:
-            response = requests.post(
+            response = _get_http_session().post(
                 RISK_ANALYZER_URL,
                 json=raw_event,
                 timeout=5
@@ -466,9 +530,11 @@ def process_security_log(self, log_data):
             response.raise_for_status()
             analyzer_result = response.json()
 
+            _dr = analyzer_result.get("detection_result", {})
             print(
                 "[Worker] Risk Score 응답 수신: "
-                f"{response.status_code} - {analyzer_result}"
+                f"{response.status_code} - score={_dr.get('risk_score')} "
+                f"level={_dr.get('level')} hits={_dr.get('rule_hits')}"
             )
 
         except Exception as req_err:
@@ -520,7 +586,10 @@ def process_security_log(self, log_data):
             _attack_type = f"{_alert_level} (risk {risk_score})"
             if _alert_hits:
                 _attack_type += " / " + ", ".join(str(h) for h in _alert_hits)
-            _report_to_analyzer(ip or "unknown", _attack_type)
+            if _should_report(ip):
+                _report_to_analyzer(ip or "unknown", _attack_type)
+            else:
+                print(f"[Worker] 🔕 {ip} 보고 쿨다운 중({REPORT_COOLDOWN_SECONDS}s) — analyzer 보고 생략")
 
             if blacklist_key:
                 try:
@@ -607,7 +676,16 @@ def process_security_log(self, log_data):
             print(f"[Worker] 🧠 {trigger}, AI 룰 생성 시작")
             gen_meta = {}
             t0 = time.time()
-            ai_rule = generate_waf_rule_with_feedback(raw_event, meta=gen_meta)
+            # [수정] LLM 단계 예외가 태스크 전체 retry 로 번지지 않게 한다.
+            # 기존: GEMINI_API_KEY 누락/클라이언트 오류 → 바깥 except → self.retry →
+            #       이미 저장한 Mongo 문서가 최대 4번 중복 저장 + analyzer(Slack/CF) 보고 4회 +
+            #       detection-engine 상태(요청 수 등) 중복 누적. (큐 벤치에서 523건 중복으로 확인)
+            try:
+                ai_rule = generate_waf_rule_with_feedback(raw_event, meta=gen_meta)
+            except Exception as llm_err:
+                print(f"[Worker] ⚠️ AI 룰 생성 예외: {llm_err} — 이벤트 처리는 완료로 간주(재시도 안 함)")
+                gen_meta["exception"] = str(llm_err)[:500]
+                ai_rule = None
             llm_latency_ms = int((time.time() - t0) * 1000)
 
             # ──────────────────────────────────────────────────────────
@@ -663,7 +741,7 @@ def process_security_log(self, log_data):
         raise self.retry(exc=exc, countdown=5)
 
 
-@celery_app.task
+@celery_app.task(ignore_result=True)
 def consume_logs_from_redis_queue():
     """
     Redis List에 쌓인 Proxy 이벤트를 꺼내 Celery Task로 넘긴다.
@@ -677,18 +755,26 @@ def consume_logs_from_redis_queue():
     이렇게 하면 오래된 이벤트부터 처리된다.
     """
     queue_name = REDIS_QUEUE_NAME
-    batch_size = 100
+    batch_size = CONSUME_BATCH_SIZE
 
     logs_processed = 0
 
     while logs_processed < batch_size:
-        log_raw = redis_client.rpop(queue_name)
+        # [처리량] RPOP key count (Redis ≥ 6.2) 로 여러 건을 한 번에 꺼낸다 (왕복 횟수 감소).
+        chunk = min(100, batch_size - logs_processed)
+        try:
+            items = redis_client.rpop(queue_name, chunk)
+        except redis_errors.ResponseError:
+            # 구버전 Redis: count 인자 미지원 → 1건씩
+            one = redis_client.rpop(queue_name)
+            items = [one] if one else None
 
-        if not log_raw:
+        if not items:
             break
 
-        process_security_log.delay(log_raw)
-        logs_processed += 1
+        for log_raw in items:
+            process_security_log.delay(log_raw)
+        logs_processed += len(items)
 
     try:
         drain_ai_rule_events()

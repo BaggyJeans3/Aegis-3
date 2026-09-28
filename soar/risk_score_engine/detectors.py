@@ -14,6 +14,19 @@ from soar.risk_score_engine.config import (
     PATH_TRAVERSAL_PATTERNS,
     SSRF_PATTERNS,
     COMMAND_INJECTION_PATTERNS,
+    SCAN_FAST_LOW,
+    SCAN_FAST_HIGH,
+    SCAN_SLOW,
+    BOLA_LOW,
+    BOLA_HIGH,
+    ASSET_CATEGORY_MIN,
+    RATE_LOW_MIN,
+    RATE_LOW_MULT,
+    RATE_HIGH_MIN,
+    RATE_HIGH_MULT,
+    AUTH_LOGIN_FAIL_MIN,
+    AUTH_JWT_ERROR_MIN,
+    AUTH_RECOVERY_MIN,
 )
 
 from soar.risk_score_engine.state import (
@@ -33,6 +46,7 @@ from soar.risk_score_engine.utils import (
     is_match_any,
     get_request_text,
     is_sequential_access,
+    safe_int,
 )
 
 
@@ -45,7 +59,7 @@ def detect_path_enumeration(log, current_time):
     - 고유 404 path 30개 이상 / 60초 → +40
     - 고유 404 path 50개 이상 / 10분 → +40
     """
-    status_code = int(log.get("status_code", 0))
+    status_code = safe_int(log.get("status_code"))
 
     if status_code != 404:
         return 0, [], None
@@ -66,16 +80,16 @@ def detect_path_enumeration(log, current_time):
     rule_hits = []
     reasons = []
 
-    if len(unique_fast_paths) >= 30:
+    if len(unique_fast_paths) >= SCAN_FAST_HIGH:
         score += 40
         rule_hits.append("R-SCAN-002")
         reasons.append(f"60초 안에 고유 404 path {len(unique_fast_paths)}개 발생")
-    elif len(unique_fast_paths) >= 15:
+    elif len(unique_fast_paths) >= SCAN_FAST_LOW:
         score += 25
         rule_hits.append("R-SCAN-001")
         reasons.append(f"60초 안에 고유 404 path {len(unique_fast_paths)}개 발생")
 
-    if len(unique_slow_paths) >= 50:
+    if len(unique_slow_paths) >= SCAN_SLOW:
         score += 40
         rule_hits.append("R-SCAN-003")
         reasons.append(f"10분 안에 고유 404 path {len(unique_slow_paths)}개 발생")
@@ -126,11 +140,11 @@ def detect_object_authorization_bypass(log, current_time):
     rule_hits = []
     reasons = []
 
-    if len(unique_object_ids) >= 10:
+    if len(unique_object_ids) >= BOLA_HIGH:
         score += 60
         rule_hits.append("R-BOLA-002")
         reasons.append(f"60초 안에 권한 없는 객체 ID {len(unique_object_ids)}개 접근")
-    elif len(unique_object_ids) >= 3:
+    elif len(unique_object_ids) >= BOLA_LOW:
         score += 40
         rule_hits.append("R-BOLA-001")
         reasons.append(f"60초 안에 권한 없는 객체 ID {len(unique_object_ids)}개 접근")
@@ -176,7 +190,7 @@ def detect_sensitive_asset_access(log, current_time):
     rule_hits = ["R-ASSET-001"]
     reasons = [f"민감 경로 접근 탐지: {path} ({matched_category})"]
 
-    if len(categories) >= 3:
+    if len(categories) >= ASSET_CATEGORY_MIN:
         score += 20
         rule_hits.append("R-ASSET-002")
         reasons.append(f"60초 안에 민감 경로 카테고리 {len(categories)}종 접근")
@@ -199,8 +213,8 @@ def detect_api_resource_overuse(log, current_time):
 
     request_count = len(ip_requests_fast[ip])
 
-    first_threshold = max(100, NORMAL_P95_PER_MINUTE * 3)
-    second_threshold = max(200, NORMAL_P95_PER_MINUTE * 6)
+    first_threshold = max(RATE_LOW_MIN, NORMAL_P95_PER_MINUTE * RATE_LOW_MULT)
+    second_threshold = max(RATE_HIGH_MIN, NORMAL_P95_PER_MINUTE * RATE_HIGH_MULT)
 
     score = 0
     rule_hits = []
@@ -232,7 +246,7 @@ def detect_auth_token_abuse(log, current_time):
     """
     session_id = log.get("session_id", "unknown")
     path = log.get("path", "").lower()
-    status_code = int(log.get("status_code", 0))
+    status_code = safe_int(log.get("status_code"))
 
     event_type = str(log.get("event_type", "")).lower()
     auth_error = str(log.get("auth_error", "")).lower()
@@ -255,7 +269,7 @@ def detect_auth_token_abuse(log, current_time):
 
         count = len(session_login_failures[session_id])
 
-        if count >= 10:
+        if count >= AUTH_LOGIN_FAIL_MIN:
             score += 40
             rule_hits.append("R-AUTH-001")
             reasons.append(f"60초 안에 로그인 실패 {count}회 발생")
@@ -272,7 +286,7 @@ def detect_auth_token_abuse(log, current_time):
 
         count = len(session_jwt_errors[session_id])
 
-        if count >= 10:
+        if count >= AUTH_JWT_ERROR_MIN:
             score += 40
             rule_hits.append("R-AUTH-002")
             reasons.append(f"60초 안에 JWT/토큰 오류 {count}회 발생")
@@ -300,7 +314,7 @@ def detect_auth_token_abuse(log, current_time):
 
         count = len(session_recovery_events[session_id])
 
-        if count >= 5:
+        if count >= AUTH_RECOVERY_MIN:
             score += 60
             rule_hits.append("R-AUTH-003")
             reasons.append(f"60초 안에 OTP/비밀번호 재설정 관련 요청 {count}회 발생")

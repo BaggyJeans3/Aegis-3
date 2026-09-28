@@ -5,13 +5,32 @@
 
 from flask import Flask, request, jsonify
 import json
+import os
+import threading
 import time
 
-from soar.risk_score_engine.config import ALERT_THRESHOLD
-from soar.risk_score_engine.utils import parse_time, get_level
+from soar.risk_score_engine.config import (
+    ALERT_THRESHOLD,
+    SLOW_WINDOW_SECONDS,
+    STATE_PURGE_EVERY,
+)
+from soar.risk_score_engine.utils import parse_time, get_level, safe_int
 from soar.risk_score_engine.detectors import get_detectors_by_profile
+from soar.risk_score_engine.state import STATE_LOCK, ALL_STATE_STORES, purge_idle_keys
 
 app = Flask(__name__)
+
+# alert_events.jsonl 저장 경로 (기본값 = 기존과 동일하게 작업 디렉터리)
+ALERT_EVENTS_PATH = os.getenv("ALERT_EVENTS_PATH", "alert_events.jsonl")
+_alert_file_lock = threading.Lock()
+
+# /health 에 노출할 간단한 런타임 지표 (부하 측정 시 확인용)
+_stats = {
+    "started_at": time.time(),
+    "analyzed": 0,
+    "alerts": 0,
+    "purged_keys": 0,
+}
 
 
 def analyze_log(log):
@@ -31,14 +50,20 @@ def analyze_log(log):
 
     detectors = get_detectors_by_profile(analysis_profile)
 
-    for detector in detectors:
-        score, rules, reason = detector(log, current_time)
+    # [추가] 상태(deque) 공유 구간은 락으로 직렬화 — Flask 멀티스레드 요청 간 경쟁 방지
+    with STATE_LOCK:
+        for detector in detectors:
+            score, rules, reason = detector(log, current_time)
 
-        total_score += score
-        rule_hits.extend(rules)
+            total_score += score
+            rule_hits.extend(rules)
 
-        if reason:
-            reasons.append(reason)
+            if reason:
+                reasons.append(reason)
+
+        _stats["analyzed"] += 1
+        if STATE_PURGE_EVERY > 0 and _stats["analyzed"] % STATE_PURGE_EVERY == 0:
+            _stats["purged_keys"] += purge_idle_keys(current_time, SLOW_WINDOW_SECONDS)
 
     total_score = min(total_score, 100)
     level = get_level(total_score)
@@ -60,7 +85,7 @@ def analyze_log(log):
         "method": log.get("method", "GET"),
         "host": log.get("host", ""),
         "path": log.get("path", ""),
-        "status_code": int(log.get("status_code", 0)),
+        "status_code": safe_int(log.get("status_code")),
 
         "action_on_match": log.get("action_on_match", "unknown"),
 
@@ -105,8 +130,9 @@ def create_alert_event(result):
         "action_required": "SEND_TO_LLM_ANALYSIS",
     }
 
-    with open("alert_events.jsonl", "a", encoding="utf-8") as file:
-        file.write(json.dumps(event_data, ensure_ascii=False) + "\n")
+    with _alert_file_lock:
+        with open(ALERT_EVENTS_PATH, "a", encoding="utf-8") as file:
+            file.write(json.dumps(event_data, ensure_ascii=False) + "\n")
 
     return event_data
 
@@ -119,6 +145,26 @@ def health_check():
     })
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    [추가] demo_setup.sh 가 http://localhost:5001/health 로 점검하는데 라우트가 없어서
+    항상 404(⚠)가 떴다. 상태 저장소 크기도 같이 노출해 부하/soak 테스트 중 메모리 추이를 본다.
+    """
+    with STATE_LOCK:
+        tracked_keys = sum(len(store) for store in ALL_STATE_STORES)
+    return jsonify({
+        "status": "ok",
+        "service": "Aegis Security Detection Engine",
+        "uptime_seconds": round(time.time() - _stats["started_at"], 1),
+        "analyzed": _stats["analyzed"],
+        "alerts": _stats["alerts"],
+        "tracked_keys": tracked_keys,
+        "purged_keys": _stats["purged_keys"],
+        "alert_threshold": ALERT_THRESHOLD,
+    })
+
+
 @app.route("/analyze", methods=["POST"])
 def analyze():
     """
@@ -127,15 +173,18 @@ def analyze():
     통신 구멍:
     Worker → POST /analyze
     """
-    log = request.get_json()
+    log = request.get_json(silent=True)
 
-    if not log:
+    # [수정] 잘못된 JSON 이면 Flask 기본 HTML 400 대신 JSON 400 을 돌려준다.
+    #        (dict 가 아닌 JSON — 배열/문자열 — 도 거절)
+    if not log or not isinstance(log, dict):
         return jsonify({"error": "JSON log is required"}), 400
 
     result = analyze_log(log)
     alert_event = None
 
     if result["alert"]:
+        _stats["alerts"] += 1
         alert_event = create_alert_event(result)
 
     return jsonify({

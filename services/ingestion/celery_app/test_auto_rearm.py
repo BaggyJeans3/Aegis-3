@@ -1,4 +1,5 @@
 import json
+import types
 
 import pytest
 
@@ -69,6 +70,10 @@ def env(monkeypatch):
 
     monkeypatch.setattr(tasks, "redis_client", r)
     monkeypatch.setattr(tasks.requests, "post", fake_post)
+    # detection-engine 호출은 재사용 세션(_get_http_session)을 거친다.
+    # 테스트에서 requests.post 를 다시 바꿔도 반영되도록 호출 시점에 위임한다.
+    monkeypatch.setattr(tasks, "_get_http_session",
+                        lambda: types.SimpleNamespace(post=lambda *a, **kw: tasks.requests.post(*a, **kw)))
     monkeypatch.setattr(tasks, "generate_waf_rule_with_feedback", fake_llm)
     monkeypatch.setattr(tasks, "get_mongo_collection", lambda name=None: Col())
     return r, calls, state
