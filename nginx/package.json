@@ -5,7 +5,7 @@
   "main": "sidecar.js",
   "dependencies": {
     "express": "^4.21.0",
-    "redis": "^4.7.0",
+    "redis": "^6.2.1",
     "tail": "^2.2.6"
   }
 }
