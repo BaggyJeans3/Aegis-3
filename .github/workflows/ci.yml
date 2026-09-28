@@ -1,16 +1,3 @@
-# ──────────────────────────────────────────────────────────────────────────
-# Aegis-3 CI
-#
-# [SOAR 담당 편입분] soar-tests / soar-engine-image 두 job.
-# 대시보드 담당 ci.yml 과 합칠 때는 아래 `jobs:` 밑의 두 job 블록만 그대로 옮기면 된다
-# (다른 job 과 의존 관계 없음, 서비스 컨테이너·시크릿 불필요).
-#
-# - soar-tests        : detection-engine detector 테스트 + SOAR worker 파이프라인 테스트 (pytest)
-# - soar-engine-image : detection-engine 이미지 빌드 후 /health · /analyze 스모크 테스트
-#
-# deploy.yml(main push → EC2 배포)과는 별개로 돈다. CI 실패 시 배포를 막으려면
-# GitHub 저장소 Settings → Branches → main 보호 규칙에서 이 체크들을 required 로 지정.
-# ──────────────────────────────────────────────────────────────────────────
 name: CI
 
 on:
@@ -25,33 +12,45 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ── 대시보드 담당: proxy 통합테스트 (Node) ──
+  proxy-test:
+    name: proxy integration test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: proxy/package-lock.json
+      - working-directory: proxy
+        run: npm ci
+      - working-directory: proxy
+        run: npm test
+
+  # ── SOAR 담당: detector & worker 테스트 (Python) ──
   soar-tests:
     name: SOAR detector & worker tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'   # detection-engine / celery 이미지와 동일
+          python-version: '3.11'
           cache: pip
           cache-dependency-path: |
             services/ingestion/celery_app/requirements.txt
             soar/risk_score_engine/requirements-test.txt
-
       - name: 의존성 설치
-        # google-genai 는 테스트에서 스텁 처리하므로 설치하지 않는다(무겁고 불필요)
         run: |
           python -m pip install --upgrade pip
           pip install -r soar/risk_score_engine/requirements-test.txt
-
       - name: detector 테스트
         run: python -m pytest soar/risk_score_engine/tests -q --junitxml=reports/detector.xml
-
       - name: worker 파이프라인 테스트
         run: python -m pytest services/ingestion/celery_app/tests -q --junitxml=reports/worker.xml
-
       - name: 테스트 리포트 업로드
         if: always()
         uses: actions/upload-artifact@v4
@@ -59,6 +58,7 @@ jobs:
           name: soar-test-reports
           path: reports/
 
+  # ── SOAR 담당: detection-engine 이미지 스모크 ──
   soar-engine-image:
     name: detection-engine image smoke test
     runs-on: ubuntu-latest
@@ -66,10 +66,8 @@ jobs:
     needs: soar-tests
     steps:
       - uses: actions/checkout@v4
-
       - name: 이미지 빌드 (docker-compose 와 동일한 context)
         run: docker build -f soar/risk_score_engine/Dockerfile -t aegis-detection-engine:ci .
-
       - name: 컨테이너 기동 후 /health, /analyze 확인
         run: |
           docker run -d --name de -p 5001:5000 aegis-detection-engine:ci
@@ -78,14 +76,12 @@ jobs:
             sleep 1
           done
           curl -fsS http://localhost:5001/health | grep -q '"status":"ok"'
-          # 허니팟 .env 접근: 민감 경로 탐지(R-ASSET-001)만 걸리고, 프록시 체인 XFF 로 SSRF 가 붙지 않아야 한다
           RESP=$(curl -fsS -X POST http://localhost:5001/analyze \
             -H 'Content-Type: application/json' \
             -d '{"ip":"203.0.113.7","path":"/.env","status_code":200,"analysis_profile":"full","headers":{"x-forwarded-for":"203.0.113.7, 127.0.0.1"}}')
           echo "$RESP"
           echo "$RESP" | grep -q 'R-ASSET-001'
           ! echo "$RESP" | grep -q 'R-PAYLOAD-002'
-
       - name: 실패 시 컨테이너 로그
         if: failure()
         run: docker logs de || true

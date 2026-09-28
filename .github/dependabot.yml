@@ -1,0 +1,39 @@
+version: 2
+updates:
+  # ── npm (Node.js) ──
+  - package-ecosystem: 'npm'
+    directory: '/proxy'
+    schedule:
+      interval: 'weekly'
+
+  - package-ecosystem: 'npm'
+    directory: '/nginx' # 룰 주입 사이드카 (express)
+    schedule:
+      interval: 'weekly'
+
+  - package-ecosystem: 'npm'
+    directory: '/services/ingestion/analyzer' # Slack/CF/Email 대응 엔진
+    schedule:
+      interval: 'weekly'
+
+  # ── pip (Python) ──
+  - package-ecosystem: 'pip'
+    directory: '/services/ingestion/celery_app' # SOAR 워커 + ai_engine
+    schedule:
+      interval: 'weekly'
+
+  - package-ecosystem: 'pip'
+    directory: '/services/aegis-portal-backend' # 대시보드 백엔드 (FastAPI)
+    schedule:
+      interval: 'weekly'
+
+  - package-ecosystem: 'pip'
+    directory: '/soar/risk_score_engine' # Risk Score 엔진 (Flask)
+    schedule:
+      interval: 'weekly'
+
+  # ── GitHub Actions 버전 감시 (deploy.yml / ci.yml) ──
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
