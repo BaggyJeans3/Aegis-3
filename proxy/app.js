@@ -1,13 +1,13 @@
-const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
-const redis = require('redis');
-const { v4: uuidv4 } = require('uuid');
-const pool = require('./db');
-require('dotenv').config();
+const express = require('express')
+const { createProxyMiddleware } = require('http-proxy-middleware')
+const redis = require('redis')
+const { v4: uuidv4 } = require('uuid')
+const pool = require('./db')
+require('dotenv').config()
 
-const app = express();
+const app = express()
 
-app.use(express.json());
+app.use(express.json())
 
 // ──────────────────────────────────────────────────────────
 // [Aegis-3 SOAR] IP 평판 1차 차단
@@ -17,42 +17,46 @@ app.use(express.json());
 // 모든 라우트보다 먼저 실행되도록 express.json() 바로 다음에 배치한다.
 // ──────────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
-  const clientIp = getClientIp(req);
+  const clientIp = getClientIp(req)
 
   if (clientIp && clientIp !== 'unknown') {
     if (!redisHealthy) {
       // Redis 비정상으로 이미 인지된 상태 → 조회 자체를 건너뛰고 통과(fail-open).
       // (조회를 시도하면 disconnect 중 멈추거나 reject 되므로, 아예 선차단해 즉시 통과)
-      noteFailOpen('redis unhealthy');
+      noteFailOpen('redis unhealthy')
     } else {
       try {
-        const isBlocked = await redisClient.exists(`aegis:blacklist:${clientIp}`);
+        const isBlocked = await redisClient.exists(
+          `aegis:blacklist:${clientIp}`,
+        )
         if (isBlocked) {
-          console.log(`[BLOCKED] ${req.method} ${req.headers.host}${req.path} from ${clientIp} — IP blacklist hit`);
+          console.log(
+            `[BLOCKED] ${req.method} ${req.headers.host}${req.path} from ${clientIp} — IP blacklist hit`,
+          )
           // 통계 카운터 (대시보드용, 실패해도 차단 동작은 계속)
-          redisClient.incr('aegis:stats:proxy_blocked').catch(() => {});
+          redisClient.incr('aegis:stats:proxy_blocked').catch(() => {})
           return res.status(403).json({
             status: 'forbidden',
             message: 'Access denied',
-          });
+          })
         }
       } catch (err) {
         // healthy 였지만 조회 순간 끊긴 레이스 → disableOfflineQueue 로 즉시 reject → 통과
-        noteFailOpen(err.message);
+        noteFailOpen(err.message)
       }
     }
   }
 
-  return next();
-});
+  return next()
+})
 
 // 1. 루트 경로 (/) 정의: 404 방지 및 시스템 상태 확인용
 app.get('/', (req, res) => {
   res.json({
     status: 'success',
     message: 'Aegis-3 Security Proxy is running.',
-  });
-});
+  })
+})
 
 // 2. 마스킹 테스트용 경로 (/user): Nginx의 sub_filter 작동 확인용
 app.get('/user', (req, res) => {
@@ -60,12 +64,12 @@ app.get('/user', (req, res) => {
     name: '홍길동',
     phone: '010-9999-8888', // Nginx에서 010-9999-****로 바뀌어야 함
     ssn: '900101-1234567', // Nginx에서 900101-1******로 바뀌어야 함
-  });
-});
+  })
+})
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000
 
-let routeCache = [];
+let routeCache = []
 
 const redisClient = redis.createClient({
   socket: {
@@ -76,7 +80,7 @@ const redisClient = redis.createClient({
   // exists() 가 offline 큐에 걸려 await 가 멈추고, 블랙리스트 미들웨어가 모든 라우트
   // 앞에 있으므로 전체 요청(심지어 /health)이 행(hang)된다 → fail-open 이 무력화됨.
   disableOfflineQueue: true,
-});
+})
 
 // ──────────────────────────────────────────────────────────
 // [Aegis-3] Redis 상태 추적 + fail-open 경보
@@ -85,84 +89,80 @@ const redisClient = redis.createClient({
 // 카운터 + 구분 가능한 [ALERT] 로그 + /health 본문으로 외부 모니터링이 감지하게 한다.
 // (error 리스너 미등록 시 node-redis 가 프로세스를 죽일 수 있어 반드시 등록)
 // ──────────────────────────────────────────────────────────
-let redisHealthy = false;
-let redisFailOpenCount = 0; // 블랙리스트 조회 실패로 통과(fail-open)시킨 요청 누적
-let lastRedisDownLog = 0; // 다운 상태 반복 로그 쓰로틀(ms)
+let redisHealthy = false
+let redisFailOpenCount = 0 // 블랙리스트 조회 실패로 통과(fail-open)시킨 요청 누적
+let lastRedisDownLog = 0 // 다운 상태 반복 로그 쓰로틀(ms)
 
 redisClient.on('ready', () => {
   if (!redisHealthy) {
-    console.warn('[Aegis-3][ALERT] Redis 복구 — IP 블랙리스트 차단 재가동');
+    console.warn('[Aegis-3][ALERT] Redis 복구 — IP 블랙리스트 차단 재가동')
   }
-  redisHealthy = true;
-});
+  redisHealthy = true
+})
 redisClient.on('error', (err) => {
   if (redisHealthy) {
     console.error(
-      `[Aegis-3][ALERT] Redis 다운 — IP 블랙리스트 차단 비활성(fail-open): ${err.message}`
-    );
+      `[Aegis-3][ALERT] Redis 다운 — IP 블랙리스트 차단 비활성(fail-open): ${err.message}`,
+    )
   }
-  redisHealthy = false;
-});
+  redisHealthy = false
+})
 redisClient.on('end', () => {
-  redisHealthy = false;
-});
+  redisHealthy = false
+})
 
 // fail-open(블랙리스트 조회 생략/실패로 통과) 1건을 계측 + 쓰로틀된 [ALERT] 로그.
 function noteFailOpen(reason) {
-  redisFailOpenCount += 1;
-  const now = Date.now();
+  redisFailOpenCount += 1
+  const now = Date.now()
   if (now - lastRedisDownLog > 10000) {
     console.error(
-      `[Aegis-3][ALERT] 블랙리스트 조회 생략/실패 — fail-open 통과(누적 ${redisFailOpenCount}건): ${reason}`
-    );
-    lastRedisDownLog = now;
+      `[Aegis-3][ALERT] 블랙리스트 조회 생략/실패 — fail-open 통과(누적 ${redisFailOpenCount}건): ${reason}`,
+    )
+    lastRedisDownLog = now
   }
 }
 
 function normalizeHost(hostHeader) {
-  if (!hostHeader) return '';
-  return hostHeader.split(':')[0].toLowerCase();
+  if (!hostHeader) return ''
+  return hostHeader.split(':')[0].toLowerCase()
 }
 
 function getClientIp(req) {
-  const forwardedFor = req.headers['x-forwarded-for'];
+  const forwardedFor = req.headers['x-forwarded-for']
 
   // [수정] Nginx/Cloudflare 뒤에 있을 때 X-Forwarded-For에는
   // "client, proxy1, proxy2"처럼 여러 IP가 들어갈 수 있으므로 첫 번째 IP를 우선 사용한다.
   if (forwardedFor) {
-    return String(forwardedFor).split(',')[0].trim();
+    return String(forwardedFor).split(',')[0].trim()
   }
 
-  return (
-    req.headers['cf-connecting-ip'] ||
-    req.ip ||
-    'unknown'
-  );
+  return req.headers['cf-connecting-ip'] || req.ip || 'unknown'
 }
 
 function matchPath(pattern, requestPath) {
-  if (!pattern) return false;
+  if (!pattern) return false
 
   if (pattern === '/*') {
-    return true;
+    return true
   }
 
   if (pattern.endsWith('/*')) {
-    const prefix = pattern.slice(0, -1);
-    return requestPath.startsWith(prefix);
+    const prefix = pattern.slice(0, -1)
+    return requestPath.startsWith(prefix)
   }
 
-  return pattern === requestPath;
+  return pattern === requestPath
 }
 
 function isValidOrigin(origin) {
-  if (!origin) return false;
+  if (!origin) return false
 
   try {
-    const parsed = new URL(origin);
-    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    const parsed = new URL(origin)
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
   } catch (error) {
-    return false;
+    return false
   }
 }
 
@@ -186,41 +186,43 @@ async function loadRoutesFromDB() {
     WHERE r.is_active = TRUE
       AND t.status = 'active'
     ORDER BY r.priority ASC
-  `;
+  `
 
-  const result = await pool.query(query);
-  routeCache = result.rows;
+  const result = await pool.query(query)
+  routeCache = result.rows
 
-  console.log(`[ROUTE CACHE] ${routeCache.length} routes loaded`);
+  console.log(`[ROUTE CACHE] ${routeCache.length} routes loaded`)
 
   // [추가] host→tenant 매핑을 Redis(aegis:routes)에 발행.
   // nginx 사이드카가 Coraza 차단 이벤트에 tenant_id 를 태깅할 때 사용한다
   // (사이드카엔 DB 가 없으므로). periodic refresh 로 자동 갱신됨.
   if (redisClient.isOpen) {
     try {
-      const map = {};
+      const map = {}
       for (const r of routeCache) {
-        const key = normalizeHost(r.inbound_domain);
+        const key = normalizeHost(r.inbound_domain)
         if (key && !map[key]) {
           map[key] = JSON.stringify({
             tenant_id: r.tenant_id,
             company_name: r.company_name,
-          });
+          })
         }
       }
-      await redisClient.del('aegis:routes');
+      await redisClient.del('aegis:routes')
       if (Object.keys(map).length > 0) {
-        await redisClient.hSet('aegis:routes', map);
+        await redisClient.hSet('aegis:routes', map)
       }
-      console.log(`[ROUTE CACHE] published ${Object.keys(map).length} host→tenant mappings to Redis`);
+      console.log(
+        `[ROUTE CACHE] published ${Object.keys(map).length} host→tenant mappings to Redis`,
+      )
     } catch (err) {
-      console.error('[ROUTE CACHE] Redis 발행 실패:', err.message);
+      console.error('[ROUTE CACHE] Redis 발행 실패:', err.message)
     }
   }
 }
 
 function findRouteFromCache(host, path, method) {
-  const normalizedHost = normalizeHost(host);
+  const normalizedHost = normalizeHost(host)
 
   const domainRules = routeCache
     .filter((rule) => {
@@ -228,17 +230,17 @@ function findRouteFromCache(host, path, method) {
         rule.inbound_domain === normalizedHost &&
         Array.isArray(rule.allowed_methods) &&
         rule.allowed_methods.includes(method)
-      );
+      )
     })
-    .sort((a, b) => a.priority - b.priority);
+    .sort((a, b) => a.priority - b.priority)
 
   for (const rule of domainRules) {
     if (matchPath(rule.path_pattern, path)) {
-      return rule;
+      return rule
     }
   }
 
-  return null;
+  return null
 }
 
 /**
@@ -255,19 +257,22 @@ function findRouteFromCache(host, path, method) {
  * log.get("status_code") 같은 flat 필드명을 기준으로 분석하기 때문이다.
  */
 function buildAnalyzerEvent(req, route, options = {}) {
-  const eventId = uuidv4();
-  const traceId = req.headers['x-request-id'] || req.headers['x-trace-id'] || `trace-${eventId}`;
-  const queryIndex = req.originalUrl.indexOf('?');
+  const eventId = uuidv4()
+  const traceId =
+    req.headers['x-request-id'] ||
+    req.headers['x-trace-id'] ||
+    `trace-${eventId}`
+  const queryIndex = req.originalUrl.indexOf('?')
 
   // [추가] payload 탐지를 위해 query/body/headers를 넣되,
   // 너무 큰 body가 Redis에 들어가지 않도록 JSON 문자열 기준으로 길이를 제한한다.
-  let requestBody = '';
+  let requestBody = ''
 
   if (req.body && Object.keys(req.body).length > 0) {
     try {
-      requestBody = JSON.stringify(req.body).slice(0, 2000);
+      requestBody = JSON.stringify(req.body).slice(0, 2000)
     } catch (error) {
-      requestBody = '[unserializable_body]';
+      requestBody = '[unserializable_body]'
     }
   }
 
@@ -286,7 +291,8 @@ function buildAnalyzerEvent(req, route, options = {}) {
     company_name: route?.company_name || null,
 
     ip: getClientIp(req),
-    session_id: req.headers['x-session-id'] || req.headers['cookie'] || 'unknown',
+    session_id:
+      req.headers['x-session-id'] || req.headers['cookie'] || 'unknown',
 
     method: req.method,
     host: normalizeHost(req.headers.host),
@@ -306,17 +312,18 @@ function buildAnalyzerEvent(req, route, options = {}) {
     // 이후 Worker/ProxyRes 단계에서 실제 응답코드로 보강할 수 있다.
     status_code: options.status_code ?? 0,
 
-    action_on_match: options.action_on_match || route?.action_on_match || 'unknown',
+    action_on_match:
+      options.action_on_match || route?.action_on_match || 'unknown',
     route_id: route?.route_id || null,
     route_description: route?.description || null,
-  };
+  }
 }
 
 async function pushSecurityEvent(event) {
-  console.log('[SECURITY EVENT]', JSON.stringify(event));
+  console.log('[SECURITY EVENT]', JSON.stringify(event))
 
   if (redisClient.isOpen) {
-    await redisClient.lPush('aegis:security-events', JSON.stringify(event));
+    await redisClient.lPush('aegis:security-events', JSON.stringify(event))
   }
 }
 
@@ -328,17 +335,17 @@ function sendHoneypotResponse(req, res, route) {
     analysis_profile: 'full',
     status_code: 200,
     action_on_match: 'honeypot',
-  });
+  })
 
   pushSecurityEvent(event).catch((error) => {
-    console.error('[REDIS LOG ERROR]', error.message);
-  });
+    console.error('[REDIS LOG ERROR]', error.message)
+  })
 
   return res.status(200).json({
     status: 'ok',
     message: 'debug endpoint initialized',
     trace_id: `decoy-${uuidv4()}`,
-  });
+  })
 }
 
 function sendBlockedResponse(req, res, route) {
@@ -349,16 +356,16 @@ function sendBlockedResponse(req, res, route) {
     analysis_profile: 'full',
     status_code: 403,
     action_on_match: 'block',
-  });
+  })
 
   pushSecurityEvent(event).catch((error) => {
-    console.error('[REDIS LOG ERROR]', error.message);
-  });
+    console.error('[REDIS LOG ERROR]', error.message)
+  })
 
   return res.status(403).json({
     status: 'blocked',
     message: 'Blocked by Aegis-3 security policy',
-  });
+  })
 }
 
 function sendLogOnlyResponse(req, route) {
@@ -369,11 +376,11 @@ function sendLogOnlyResponse(req, route) {
     analysis_profile: 'full',
     status_code: 0,
     action_on_match: 'log_only',
-  });
+  })
 
   pushSecurityEvent(event).catch((error) => {
-    console.error('[REDIS LOG ERROR]', error.message);
-  });
+    console.error('[REDIS LOG ERROR]', error.message)
+  })
 }
 
 function sendAccessEvent(req, route) {
@@ -386,18 +393,18 @@ function sendAccessEvent(req, route) {
     analysis_profile: 'rate_only',
     status_code: 0,
     action_on_match: 'proxy',
-  });
+  })
 
   pushSecurityEvent(event).catch((error) => {
-    console.error('[REDIS LOG ERROR]', error.message);
-  });
+    console.error('[REDIS LOG ERROR]', error.message)
+  })
 }
 
 app.get('/health', (req, res) => {
   // 프로세스 자체는 살아있으므로 항상 200(liveness). Redis 가 죽어도 컨테이너를
   // 재시작하지 않는다(fail-open 의도). 블랙리스트 차단 가동 여부는 본문으로 노출하고,
   // 모니터링은 blacklist_enforced=false 또는 [ALERT] 로그로 경보를 건다.
-  const blacklistEnforced = redisClient.isOpen && redisHealthy;
+  const blacklistEnforced = redisClient.isOpen && redisHealthy
   return res.status(200).json({
     status: blacklistEnforced ? 'ok' : 'degraded',
     service: 'aegis3-proxy',
@@ -408,46 +415,46 @@ app.get('/health', (req, res) => {
       blacklist_enforced: blacklistEnforced,
       fail_open_count: redisFailOpenCount,
     },
-  });
-});
+  })
+})
 
 app.post('/admin/routes/refresh', async (req, res) => {
-  const adminKey = req.headers['x-admin-key'];
+  const adminKey = req.headers['x-admin-key']
 
   if (!adminKey || adminKey !== process.env.ADMIN_REFRESH_KEY) {
     return res.status(401).json({
       status: 'unauthorized',
       message: 'Invalid admin key',
-    });
+    })
   }
 
   try {
-    await loadRoutesFromDB();
+    await loadRoutesFromDB()
 
     return res.status(200).json({
       status: 'ok',
       message: 'Route cache refreshed',
       route_count: routeCache.length,
-    });
+    })
   } catch (error) {
-    console.error('[ROUTE REFRESH ERROR]', error);
+    console.error('[ROUTE REFRESH ERROR]', error)
 
     return res.status(500).json({
       status: 'error',
       message: 'Failed to refresh route cache',
-    });
+    })
   }
-});
+})
 
 app.use(async (req, res, next) => {
-  const host = req.headers.host;
-  const path = req.path;
-  const method = req.method;
-  const clientIp = getClientIp(req);
+  const host = req.headers.host
+  const path = req.path
+  const method = req.method
+  const clientIp = getClientIp(req)
 
-  console.log(`[REQUEST] ${method} ${host}${path} from ${clientIp}`);
+  console.log(`[REQUEST] ${method} ${host}${path} from ${clientIp}`)
 
-  const matchedRoute = findRouteFromCache(host, path, method);
+  const matchedRoute = findRouteFromCache(host, path, method)
 
   if (!matchedRoute) {
     // [수정] route가 없는 요청도 Analyzer 입력 필드명에 맞춰 Redis에 기록한다.
@@ -457,62 +464,62 @@ app.use(async (req, res, next) => {
       analysis_profile: 'full',
       status_code: 404,
       action_on_match: 'no_route',
-    });
+    })
 
-    await pushSecurityEvent(event);
+    await pushSecurityEvent(event)
 
     return res.status(404).json({
       status: 'not_found',
       message: 'No matching route found',
-    });
+    })
   }
 
   console.log(
-    `[MATCHED] ${matchedRoute.inbound_domain} ${matchedRoute.path_pattern} -> ${matchedRoute.action_on_match}`
-  );
+    `[MATCHED] ${matchedRoute.inbound_domain} ${matchedRoute.path_pattern} -> ${matchedRoute.action_on_match}`,
+  )
 
   switch (matchedRoute.action_on_match) {
     case 'block':
-      return sendBlockedResponse(req, res, matchedRoute);
+      return sendBlockedResponse(req, res, matchedRoute)
 
     case 'honeypot':
-      return sendHoneypotResponse(req, res, matchedRoute);
+      return sendHoneypotResponse(req, res, matchedRoute)
 
     case 'log_only':
-      sendLogOnlyResponse(req, matchedRoute);
+      sendLogOnlyResponse(req, matchedRoute)
 
       if (!isValidOrigin(matchedRoute.target_origin)) {
         return res.status(500).json({
           status: 'error',
           message: 'Invalid target origin for log_only route',
-        });
+        })
       }
 
-      req.targetOrigin = matchedRoute.target_origin;
-      return next();
+      req.targetOrigin = matchedRoute.target_origin
+      return next()
 
     case 'proxy':
       if (!isValidOrigin(matchedRoute.target_origin)) {
         return res.status(500).json({
           status: 'error',
           message: 'Invalid target origin for proxy route',
-        });
+        })
       }
 
       // [추가] 정상 proxy 요청도 access_event로 Redis에 넣는다.
       // 위험 이벤트가 아니라 요청량 폭증 탐지용 이벤트다.
-      sendAccessEvent(req, matchedRoute);
+      sendAccessEvent(req, matchedRoute)
 
-      req.targetOrigin = matchedRoute.target_origin;
-      return next();
+      req.targetOrigin = matchedRoute.target_origin
+      return next()
 
     default:
       return res.status(500).json({
         status: 'error',
         message: 'Unknown route action',
-      });
+      })
   }
-});
+})
 
 // 단일 프록시 미들웨어 인스턴스 생성 (router 옵션을 통한 동적 라우팅)
 const dynamicProxyMiddleware = createProxyMiddleware({
@@ -520,41 +527,46 @@ const dynamicProxyMiddleware = createProxyMiddleware({
   changeOrigin: true,
   xfwd: true,
   router: (req) => {
-    return req.targetOrigin;
+    return req.targetOrigin
   },
-});
+})
 
 // targetOrigin이 설정된 요청만 프록시 미들웨어 통과
 app.use((req, res, next) => {
   if (req.targetOrigin) {
-    return dynamicProxyMiddleware(req, res, next);
+    return dynamicProxyMiddleware(req, res, next)
   }
 
-  next();
-});
+  next()
+})
 
 async function startServer() {
   try {
-    await redisClient.connect();
-    console.log('[REDIS] connected');
+    await redisClient.connect()
+    console.log('[REDIS] connected')
 
-    await loadRoutesFromDB();
+    await loadRoutesFromDB()
 
     setInterval(async () => {
       try {
-        await loadRoutesFromDB();
+        await loadRoutesFromDB()
       } catch (error) {
-        console.error('[ROUTE CACHE AUTO REFRESH ERROR]', error.message);
+        console.error('[ROUTE CACHE AUTO REFRESH ERROR]', error.message)
       }
-    }, 30000);
+    }, 30000)
 
     app.listen(PORT, () => {
-      console.log(`Aegis-3 proxy server running on port ${PORT}`);
-    });
+      console.log(`Aegis-3 proxy server running on port ${PORT}`)
+    })
   } catch (error) {
-    console.error('[STARTUP ERROR]', error);
-    process.exit(1);
+    console.error('[STARTUP ERROR]', error)
+    process.exit(1)
   }
 }
 
-startServer();
+// node app.js 로 직접 켤 때만 서버 기동. 테스트(require)에선 실행 안 함.
+if (require.main === module) {
+  startServer()
+}
+
+module.exports = app
