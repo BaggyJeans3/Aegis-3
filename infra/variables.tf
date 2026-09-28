@@ -4,15 +4,26 @@ variable "aws_region" {
 }
 
 variable "name_prefix" {
-  type = string
+  type    = string
+  default = "aegis-3"
 }
 
 variable "vpc_id" {
-  type = string
+  description = "null이면 기본 VPC 자동 사용"
+  type        = string
+  default     = null
 }
 
 variable "subnet_id" {
-  type = string
+  description = "null이면 기본 VPC 의 기본 서브넷 자동 사용"
+  type        = string
+  default     = null
+}
+
+variable "availability_zone" {
+  description = "subnet_id 를 지정하지 않았을 때 기본 서브넷을 고를 가용영역"
+  type        = string
+  default     = "ap-northeast-2a"
 }
 
 variable "instance_type" {
@@ -26,7 +37,9 @@ variable "associate_public_ip_address" {
 }
 
 variable "cloudflare_ipv4_cidrs" {
-  type = list(string)
+  description = "null이면 https://www.cloudflare.com/ips-v4 에서 자동 조회"
+  type        = list(string)
+  default     = null
 }
 
 variable "db_allowed_cidrs" {
@@ -35,8 +48,9 @@ variable "db_allowed_cidrs" {
 }
 
 variable "key_name" {
-  type    = string
-  default = null
+  description = "null이면 SSH 키페어를 새로 생성"
+  type        = string
+  default     = null
 }
 
 variable "tailscale_auth_key" {

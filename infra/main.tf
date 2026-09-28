@@ -21,10 +21,10 @@ locals {
 resource "aws_instance" "ec2" {
   ami                         = data.aws_ssm_parameter.ubuntu_2404_amd64.value
   instance_type               = var.instance_type
-  subnet_id                   = var.subnet_id
+  subnet_id                   = local.subnet_id
   vpc_security_group_ids      = [aws_security_group.ec2_sg.id]
   associate_public_ip_address = var.associate_public_ip_address
-  key_name                    = var.key_name
+  key_name                    = local.key_name
 
   # IAM 인스턴스 프로파일 연결 추가
   iam_instance_profile = aws_iam_instance_profile.ec2_profile.name

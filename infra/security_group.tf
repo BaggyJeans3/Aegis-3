@@ -1,7 +1,7 @@
 resource "aws_security_group" "ec2_sg" {
   name        = "${var.name_prefix}-sg"
   description = "Security group for ${var.name_prefix} EC2 (Cloudflare Only & Tailscale Auth)"
-  vpc_id      = var.vpc_id
+  vpc_id      = local.vpc_id
 
   revoke_rules_on_delete = true
 
@@ -15,7 +15,7 @@ resource "aws_security_group" "ec2_sg" {
     from_port   = 80
     to_port     = 80
     protocol    = "tcp"
-    cidr_blocks = var.cloudflare_ipv4_cidrs
+    cidr_blocks = local.cloudflare_ipv4_cidrs
   }
 
   ingress {
@@ -23,7 +23,7 @@ resource "aws_security_group" "ec2_sg" {
     from_port   = 443
     to_port     = 443
     protocol    = "tcp"
-    cidr_blocks = var.cloudflare_ipv4_cidrs
+    cidr_blocks = local.cloudflare_ipv4_cidrs
   }
 
   # ==========================================
