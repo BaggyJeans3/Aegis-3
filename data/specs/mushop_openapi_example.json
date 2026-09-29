@@ -2,11 +2,23 @@
   "openapi": "3.0.0",
   "info": { "title": "MuShop API", "version": "1.0" },
   "paths": {
+    "/api/config": {
+      "get": { "summary": "스토어프론트 설정 (페이지 로드마다 호출 — 명세에 없으면 /api/config 허니팟 미끼에 걸림)" }
+    },
     "/api/login": {
       "post": { "summary": "로그인 (SQL Injection 공격이 주로 발생하는 지점)" }
     },
+    "/api/logout": {
+      "get": { "summary": "로그아웃" }
+    },
     "/api/register": {
       "post": { "summary": "회원가입 (데이터 유효성 검사 대상)" }
+    },
+    "/api/profile": {
+      "get": { "summary": "내 프로필 조회" }
+    },
+    "/api/categories": {
+      "get": { "summary": "상품 카테고리 목록" }
     },
     "/api/catalogue": {
       "get": { "summary": "전체 상품 목록 조회" }
@@ -14,11 +26,39 @@
     "/api/catalogue/{id}": {
       "get": { "summary": "특정 상품 상세 정보" }
     },
+    "/api/cart": {
+      "get": { "summary": "장바구니 조회" },
+      "delete": { "summary": "장바구니 비우기" }
+    },
+    "/api/cart/update": {
+      "post": { "summary": "장바구니 수량 변경" }
+    },
+    "/api/cart/{id}": {
+      "delete": { "summary": "장바구니 항목 삭제" }
+    },
     "/api/carts/{id}/items": {
       "post": { "summary": "장바구니 담기 (인증 토큰 변조 감시)" }
     },
+    "/api/address": {
+      "get": { "summary": "배송지 조회" },
+      "post": { "summary": "배송지 등록" }
+    },
+    "/api/addresses/{id}": {
+      "delete": { "summary": "배송지 삭제" }
+    },
+    "/api/card": {
+      "get": { "summary": "결제카드 조회" },
+      "post": { "summary": "결제카드 등록" }
+    },
+    "/api/cards/{id}": {
+      "delete": { "summary": "결제카드 삭제" }
+    },
     "/api/orders": {
+      "get": { "summary": "주문 내역 조회" },
       "post": { "summary": "결제 및 주문 생성 (IDOR 공격 차단 필요)" }
+    },
+    "/api/orders/{id}": {
+      "get": { "summary": "주문 상세 조회" }
     },
     "/api/assets/{path}": {
       "get": { "summary": "정적 리소스(이미지 등)" }
