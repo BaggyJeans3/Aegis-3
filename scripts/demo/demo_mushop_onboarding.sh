@@ -14,8 +14,12 @@ set -u
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SPEC_FILE="$REPO_ROOT/data/specs/mushop_openapi_example.json"
-DOMAIN="mushop.aegis3.local"
-ORIGIN="http://140.245.69.134"
+# 환경변수로 덮어쓸 수 있다. 기본값은 로컬 개발(nginx 8080) 기준.
+# EC2 운영(nginx 80, 실제 도메인) 예:
+#   DOMAIN=mushop.aegis3.cloud NGINX_URL=http://localhost bash scripts/demo/demo_mushop_onboarding.sh
+DOMAIN="${DOMAIN:-mushop.aegis3.local}"
+ORIGIN="${ORIGIN:-http://140.245.69.134}"          # 오라클에 올라간 MuShop 실제 서버
+NGINX_URL="${NGINX_URL:-http://localhost:8080}"    # Aegis 입구(nginx). EC2 는 http://localhost
 H="Host: $DOMAIN"
 
 GREEN='\033[1;32m'
@@ -127,7 +131,7 @@ pause 1
 
 subheader "고객: 상품 목록 조회"
 info "→ curl -H \"$H\" $DOMAIN/api/catalogue"
-STATUS=$(curl -s -o /tmp/mushop_demo_resp.json -w "%{http_code}" -H "$H" "http://localhost:8080/api/catalogue")
+STATUS=$(curl -s -o /tmp/mushop_demo_resp.json -w "%{http_code}" -H "$H" "$NGINX_URL/api/catalogue")
 echo ""
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 head -c 200 /tmp/mushop_demo_resp.json; echo "..."
@@ -147,8 +151,8 @@ pause 1
 
 subheader "공격자: 존재하지 않는 백업/설정 API 스캔 시도"
 info "→ curl -H \"$H\" $DOMAIN/api/backup"
-RESPONSE=$(curl -s -H "$H" "http://localhost:8080/api/backup")
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "http://localhost:8080/api/backup")
+RESPONSE=$(curl -s -H "$H" "$NGINX_URL/api/backup")
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "$NGINX_URL/api/backup")
 echo ""
 echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo "응답: $RESPONSE"
@@ -162,7 +166,7 @@ fi
 pause 4
 
 subheader "공격자: 민감 파일 접근 시도 (.env) — 1차 WAF가 먼저 차단"
-STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "http://localhost:8080/.env")
+STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "$NGINX_URL/.env")
 echo ""
 if [ "$STATUS" = "403" ]; then
   echo -e "${RED}  ⛔ 응답 코드: $STATUS (Coraza WAF 1차 차단)${RESET}"
