@@ -1,10 +1,10 @@
-
 #!/bin/bash
+# 주의: 첫 줄은 반드시 #!/bin/bash 여야 cloud-init 이 셸 스크립트로 실행한다 (앞에 빈 줄 금지)
 # 시스템 업데이트 및 필요 패키지 설치
 apt-get update -y
 apt-get install -y curl
 
-# 도커/도커 컴포즈 설치 
+# 도커/도커 컴포즈 설치
 curl -fsSL https://get.docker.com -o get-docker.sh
 sh get-docker.sh
 apt-get install -y docker-compose-plugin

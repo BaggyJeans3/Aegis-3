@@ -62,6 +62,14 @@ resource "aws_security_group" "ec2_sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
+  egress {
+    description = "SMTPS outbound (analyzer Gmail security report)"
+    from_port   = 465
+    to_port     = 465
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
   # --- Tailscale 동작을 위한 필수 UDP Outbound 추가 ---
   egress {
     description = "Tailscale STUN (UDP hole punching)"

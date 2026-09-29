@@ -36,9 +36,10 @@ resource "aws_instance" "ec2" {
   }
 
   # Tailscale 자동 설치 스크립트 주입
-  user_data = templatefile("${path.module}/user_data.sh.tftpl", {
+  # 윈도우 체크아웃(CRLF)에서 apply 해도 `#!/bin/bash\r` 로 깨지지 않도록 \r 제거
+  user_data = replace(templatefile("${path.module}/user_data.sh.tftpl", {
     tailscale_auth_key = var.tailscale_auth_key
-  })
+  }), "\r", "")
 
   tags = local.common_tags
 }
