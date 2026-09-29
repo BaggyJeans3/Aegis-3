@@ -96,7 +96,9 @@ services:
 
   # 5. MongoDB (로그 저장)
   mongodb:
-    image: mongo:latest
+    # latest 금지: MongoDB 8.0+ 는 Linux 커널 6.19+ 에서 기동 거부(SERVER-121912, TCMalloc rseq 문제).
+    # Ubuntu 24.04 EC2 는 커널이 6.19+ 이므로 영향 없는 7.0 으로 고정한다.
+    image: mongo:7.0
     container_name: aegis-mongodb
     environment:
       MONGO_INITDB_ROOT_USERNAME: aegis_user
