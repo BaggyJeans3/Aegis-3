@@ -25,3 +25,9 @@ test('없는 경로 → 404 + Redis 큐에 LPUSH', async () => {
   expect(queue).toBe('aegis:security-events')
   expect(JSON.parse(payload).action_on_match).toBe('no_route')
 })
+
+test('고객사 라우트 없는 도메인의 / → 프록시 상태 JSON', async () => {
+  const res = await request(app).get('/').set('Host', 'unknown.example.com')
+  expect(res.status).toBe(200)
+  expect(res.body.message).toBe('Aegis-3 Security Proxy is running.')
+})

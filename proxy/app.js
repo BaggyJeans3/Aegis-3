@@ -51,15 +51,19 @@ app.use(async (req, res, next) => {
 })
 
 // 1. 루트 경로 (/) 정의: 404 방지 및 시스템 상태 확인용
-app.get('/', (req, res) => {
+//    단, 해당 도메인에 고객사 라우트가 등록돼 있으면 고객사 서버로 넘긴다
+//    (예: mushop.aegis3.cloud 메인 화면이 고객사 사이트로 떠야 함)
+app.get('/', (req, res, next) => {
+  if (findRouteFromCache(req.headers.host, req.path, req.method)) return next()
   res.json({
     status: 'success',
     message: 'Aegis-3 Security Proxy is running.',
   })
 })
 
-// 2. 마스킹 테스트용 경로 (/user): Nginx의 sub_filter 작동 확인용
-app.get('/user', (req, res) => {
+// 2. 마스킹 테스트용 경로 (/user): Nginx의 sub_filter 작동 확인용 (고객사 라우트 우선)
+app.get('/user', (req, res, next) => {
+  if (findRouteFromCache(req.headers.host, req.path, req.method)) return next()
   res.json({
     name: '홍길동',
     phone: '010-9999-8888', // Nginx에서 010-9999-****로 바뀌어야 함
