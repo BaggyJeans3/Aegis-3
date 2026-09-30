@@ -45,20 +45,27 @@ function spreadIp() {
   return `198.18.${Math.floor(n / 256)}.${n % 256}`;
 }
 
+// http_req_failed 기준: k6 기본값은 4xx 전부 실패 → WAF 가 공격을 403 으로 막을수록 실패율이 올라
+// attack/mixed 가 항상 불합격이었다. WAF 차단(401/403)은 '정상 응답'으로 본다.
+// 429(rate limit)는 정상 사용자가 막힌 것이므로 계속 실패로 센다.
+http.setResponseCallback(http.expectedStatuses({ min: 200, max: 399 }, 401, 403));
+
 // 커스텀 메트릭
 const blockedRequests = new Counter('aegis_blocked_requests');   // 403 차단 수
 const passedRequests = new Counter('aegis_passed_requests');     // 200 통과 수
+const rateLimited = new Counter('aegis_rate_limited');           // 429 (nginx limit_req) 수
 const wafLatency = new Trend('aegis_waf_latency', true);         // 응답시간 추이
 const correctVerdict = new Rate('aegis_correct_verdict');        // 기대대로 동작한 비율
 
 // ---------------------------------------------------------
 // 요청 풀: 정상 / 공격
 // ---------------------------------------------------------
-const normalRequests = [
-  { method: 'GET', path: '/', headers: { 'User-Agent': 'Mozilla/5.0' } },
-  { method: 'GET', path: '/index.html', headers: { 'User-Agent': 'Mozilla/5.0' } },
-  { method: 'GET', path: '/ping', headers: { 'User-Agent': 'Mozilla/5.0' } },
-];
+// 대상 사이트에 실제로 있는 경로로 바꿔야 한다(없는 경로는 404 → 오판정 + R-SCAN 오탐).
+//   예: MuShop  -e NORMAL_PATHS=/,/index.html,/api/config
+const NORMAL_PATHS = (__ENV.NORMAL_PATHS || '/,/index.html,/ping').split(',');
+const normalRequests = NORMAL_PATHS.map((path) => (
+  { method: 'GET', path: path.trim(), headers: { 'User-Agent': 'Mozilla/5.0' } }
+));
 
 const attackRequests = [
   // Shadow API
@@ -128,6 +135,8 @@ const profiles = {
 };
 
 export const options = {
+  // 기본 요약엔 p(99) 가 없어 handleSummary 의 p99 가 0 으로 찍혔다
+  summaryTrendStats: ['avg', 'min', 'med', 'max', 'p(90)', 'p(95)', 'p(99)'],
   scenarios: {
     [SCENARIO]: { ...profiles[SCENARIO] },
   },
@@ -180,6 +189,8 @@ export default function() {
     blockedRequests.add(1);
   } else if (res.status === 200) {
     passedRequests.add(1);
+  } else if (res.status === 429) {
+    rateLimited.add(1);
   }
 
   // 기대대로 동작했는가?
@@ -225,11 +236,12 @@ export function handleSummary(data) {
 
  [WAF 판정]
  통과(2xx):     ${get('aegis_passed_requests', 'count')}
- 차단(4xx):     ${get('aegis_blocked_requests', 'count')}
+ 차단(401/403): ${get('aegis_blocked_requests', 'count')}
+ 제한(429):     ${get('aegis_rate_limited', 'count')}
  정확도:        ${(get('aegis_correct_verdict', 'rate') * 100).toFixed(2)} %
 
  [안정성]
- 연결 실패율:   ${(get('http_req_failed', 'rate') * 100).toFixed(3)} %
+ 실패율:        ${(get('http_req_failed', 'rate') * 100).toFixed(3)} %  (2xx/3xx/401/403 외 응답·연결 실패)
 ========================================
 `;
 
