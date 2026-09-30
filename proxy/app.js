@@ -1,3 +1,5 @@
+const http = require('http')
+const https = require('https')
 const express = require('express')
 const { createProxyMiddleware } = require('http-proxy-middleware')
 const redis = require('redis')
@@ -525,20 +527,65 @@ app.use(async (req, res, next) => {
   }
 })
 
-// 단일 프록시 미들웨어 인스턴스 생성 (router 옵션을 통한 동적 라우팅)
-const dynamicProxyMiddleware = createProxyMiddleware({
-  target: 'http://localhost', // 기본값 (router 함수에서 덮어씌워짐)
-  changeOrigin: true,
-  xfwd: true,
-  router: (req) => {
-    return req.targetOrigin
-  },
-})
+// [부하 대응] 고객사 서버로의 연결 재사용 + 응답 대기 상한.
+// 기존엔 요청마다 새 TCP 연결을 열어, 9/30 k6 normal(≈150 RPS)에서 40초 만에 고객사 서버가
+// 새 연결을 받지 못해 proxy 가 응답 없이 멈췄다(nginx 60s upstream timeout → 사용자 404/504).
+// keep-alive 로 연결을 재사용하고, 응답이 없으면 UPSTREAM_TIMEOUT_MS 후 504 로 빨리 끊는다.
+const UPSTREAM_TIMEOUT_MS = parseInt(process.env.UPSTREAM_TIMEOUT_MS || '15000', 10)
+const UPSTREAM_MAX_SOCKETS = parseInt(process.env.UPSTREAM_MAX_SOCKETS || '256', 10)
+const agentOptions = {
+  keepAlive: true,
+  maxSockets: UPSTREAM_MAX_SOCKETS, // 고객사 서버(host:port)당 동시 연결 상한
+  maxFreeSockets: 64,
+  timeout: UPSTREAM_TIMEOUT_MS,
+}
+
+// agent 는 프로토콜별로 따로 써야 하므로(http.Agent 로 https 대상 호출 불가) 미들웨어도 둘로 나눈다.
+function buildProxyMiddleware(agent) {
+  return createProxyMiddleware({
+    target: 'http://localhost', // 기본값 (router 함수에서 덮어씌워짐)
+    changeOrigin: true,
+    xfwd: true,
+    agent,
+    proxyTimeout: UPSTREAM_TIMEOUT_MS,
+    router: (req) => {
+      return req.targetOrigin
+    },
+    on: {
+      // nginx 는 proxy 에 HTTP/1.0 + "Connection: close" 로 요청하고, http-proxy 는 이 헤더를
+      // 그대로 고객사 서버로 넘겨 매번 연결이 닫힌다 → keep-alive 로 덮어써야 agent 가 재사용한다.
+      proxyReq: (proxyReq) => {
+        proxyReq.setHeader('Connection', 'keep-alive')
+      },
+      // http-proxy-middleware v3 는 기본 logger 가 noop 이라 upstream 오류가 로그에 남지 않았다.
+      // on.error 를 지정하면 기본 error-response 플러그인이 빠지므로 응답도 여기서 직접 보낸다.
+      error: (err, req, res) => {
+        console.error(
+          `[UPSTREAM ERROR] ${req.method} ${req.headers.host}${req.url} -> ${req.targetOrigin}: ${err.code || ''} ${err.message}`,
+        )
+        if (typeof res.writeHead !== 'function') {
+          res.destroy() // websocket 등 socket 인 경우
+          return
+        }
+        if (!res.headersSent) {
+          const status = ['ECONNRESET', 'ETIMEDOUT', 'ESOCKETTIMEDOUT'].includes(err.code) ? 504 : 502
+          res.writeHead(status, { 'Content-Type': 'application/json' })
+        }
+        res.end(JSON.stringify({ status: 'error', message: 'Upstream server did not respond' }))
+      },
+    },
+  })
+}
+
+const httpProxyMiddleware = buildProxyMiddleware(new http.Agent(agentOptions))
+const httpsProxyMiddleware = buildProxyMiddleware(new https.Agent(agentOptions))
 
 // targetOrigin이 설정된 요청만 프록시 미들웨어 통과
 app.use((req, res, next) => {
   if (req.targetOrigin) {
-    return dynamicProxyMiddleware(req, res, next)
+    return req.targetOrigin.startsWith('https:')
+      ? httpsProxyMiddleware(req, res, next)
+      : httpProxyMiddleware(req, res, next)
   }
 
   next()
