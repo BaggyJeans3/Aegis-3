@@ -31,6 +31,19 @@ def _generate_api_key() -> str:
     return "aegis_" + secrets.token_hex(16)
 
 
+def _normalize_domain(value: str) -> str:
+    """
+    inbound_domain 을 proxy 가 비교하는 형태(소문자 호스트명만)로 정규화.
+    proxy/app.js normalizeHost 는 Host 헤더에서 포트만 떼고 문자열 일치(===)로 비교하므로,
+    'https://mushop.aegis3.cloud/' 처럼 스킴·경로가 붙어 저장되면 어떤 요청과도 매칭되지 않는다.
+    """
+    host = (value or "").strip().lower()
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0].split("?", 1)[0].split(":", 1)[0]
+    return host.rstrip(".")
+
+
 def _build_router_rows(spec_text: str, target_origin: str) -> tuple[list[dict], int]:
     """spec_text -> routers INSERT 행 목록. (rows, 파싱된 구체 라우트 개수) 반환."""
     parsed_routes = parse_openapi_spec(spec_text)
@@ -87,6 +100,7 @@ async def create_customer(
     """
     pool = get_pool()
     api_key = _generate_api_key()
+    inbound_domain = _normalize_domain(inbound_domain)
 
     # supabase_user_id 가 유효한 UUID 인지 확인 (아니면 None 으로)
     try:

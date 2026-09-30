@@ -16,10 +16,14 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SPEC_FILE="$REPO_ROOT/data/specs/mushop_openapi_example.json"
 # 환경변수로 덮어쓸 수 있다. 기본값은 로컬 개발(nginx 8080) 기준.
 # EC2 운영(nginx 80, 실제 도메인) 예:
-#   DOMAIN=mushop.aegis3.cloud NGINX_URL=http://localhost bash scripts/demo/demo_mushop_onboarding.sh
+#   OWNER_USER_ID=<고객사 계정 Supabase UUID> DOMAIN=mushop.aegis3.cloud NGINX_URL=http://localhost \
+#     bash scripts/demo/demo_mushop_onboarding.sh
 DOMAIN="${DOMAIN:-mushop.aegis3.local}"
 ORIGIN="${ORIGIN:-http://140.245.69.134}"          # 오라클에 올라간 MuShop 실제 서버
 NGINX_URL="${NGINX_URL:-http://localhost:8080}"    # Aegis 입구(nginx). EC2 는 http://localhost
+# MuShop 테넌트 소유자(Supabase auth.users.id, UUID). 비우면 소유자 NULL 로 등록되어
+# 고객사 대시보드(소유 tenant 필터)에서 로그가 보이지 않고 관리자 화면에서만 보인다.
+OWNER_USER_ID="${OWNER_USER_ID:-}"
 H="Host: $DOMAIN"
 
 GREEN='\033[1;32m'
@@ -47,6 +51,11 @@ echo -e "${BOLD}╔════════════════════�
 echo -e "${BOLD}║   🛡️  Aegis-3 — 신규 고객사 자동 온보딩 시연 (MuShop)     ║${RESET}"
 echo -e "${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}"
 pause 2
+
+if [ -z "$OWNER_USER_ID" ]; then
+  echo -e "${YELLOW}  ⚠ OWNER_USER_ID 미지정 — MuShop 이 소유자 없이 등록되어 고객사 대시보드에서는 로그가 안 보입니다 (관리자 화면만 표시).${RESET}"
+  pause 2
+fi
 
 # ============================================================
 # [A] 기존 데이터 정리 (재실행 가능하도록)
@@ -88,7 +97,7 @@ async def main():
         company_name='MuShop',
         plan_type='FREE',
         spec_text=spec_text,
-        supabase_user_id='demo-onboarding',
+        supabase_user_id='${OWNER_USER_ID:-demo-onboarding}',
         inbound_domain='$DOMAIN',
         target_origin='$ORIGIN',
     )
