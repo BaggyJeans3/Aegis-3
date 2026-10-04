@@ -23,8 +23,10 @@
                            ▼
 ┌──────────────────────────────────────────────────────┐
 │                   Aegis-3 Proxy                      │ (Port 3000, Express)
+│  ├─ IP 블랙리스트 1차 차단 (Redis, fail-open)          │
 │  ├─ PostgreSQL 기반 동적 라우팅                       │
-│  └─ honeypot / block / decoy 응답                     │
+│  ├─ honeypot / block / decoy 응답                     │
+│  └─ 고객사 서버 keep-alive 연결 재사용 + 타임아웃      │
 └──────────────────────────┬───────────────────────────┘
                            │ (LPUSH aegis:security-events)
                            ▼
@@ -42,7 +44,7 @@
 ┌────────────────┐ ┌────────────────┐ ┌────────────────────────┐
 │ Detection      │ │   MongoDB      │ │  ai_engine             │
 │ Engine :5000   │ │ aegis_logs/    │ │  Google Gemini 2.5     │
-│ /analyze       │ │ security_logs  │ │  + JSON 강제 + 피드백  │
+│ /analyze       │ │ traffic_logs   │ │  + JSON 강제 + 피드백  │
 │ risk_score+    │ │                │ │   루프 + 정규식 검증    │
 │ rule_hits      │ │                │ │                        │
 └────────────────┘ └────────────────┘ └───────────┬────────────┘
@@ -82,6 +84,8 @@
    - Coraza WAF가 Nginx 동적 모듈로 삽입되어 SQL Injection, XSS, Path Traversal 등의 위협을 실시간 탐지하고 차단합니다.
    - 공식 **OWASP CRS (Core Rule Set)** 및 Aegis-3 전용 커스텀 정책 룰셋을 원격 통합 관리합니다.
    - **Rate Limit (L7 1차 방어):** 프론트 server(`:80`)에서 단일 IP 기준 분당 요청을 제한합니다(`limit_req_zone`, 기본 `60r/m` + `burst=20`, 초과 시 `429`). 검증 경로 `/__masking_test__/` 는 제외하며, `rate`/`burst` 값은 운영 트래픽에 맞게 조정합니다.
+   - **Cloudflare Real IP 복원:** 운영 트래픽은 Cloudflare 를 거쳐 들어오므로, `set_real_ip_from`(Cloudflare 대역) + `real_ip_header CF-Connecting-IP` 로 `$remote_addr` 를 실제 방문자 IP 로 복원합니다. 이게 없으면 Rate Limit 이 방문자가 아니라 Cloudflare 엣지 단위로 걸려 정상 사용자가 429 를 받습니다. 대역은 `nginx.conf` 의 `BEGIN/END cloudflare-ips` 사이에 있으며 `scripts/ops/update_cloudflare_ips.sh` 로 갱신합니다(`DRY_RUN=1` 이면 비교만).
+   - **부하 테스트 예외:** `nginx.conf` 의 `geo $aegis_rl_exempt` 에 IP 를 추가하고 reload 하면 해당 IP 는 Rate Limit 에서 제외됩니다(테스트 후 반드시 제거).
 
 2. **개인정보 자동 마스킹 (Nginx subs_filter 정규식 + 2-pass 구조)**
    - 백엔드 응답 본문에 노출된 **전화번호·주민등록번호·카드번호·이메일**을 `ngx_http_substitutions_filter_module` 의 **PCRE 정규식**으로 가로채, 형식은 유지하고 값만 가리는 형태로 실시간 치환합니다 (예: `010-1234-5678` → `010-****-****`, `900101-1234567` → `900101-1******`, `1234-5678-9012-3456` → `****-****-****-3456`, `user@example.com` → `****@example.com`).
@@ -91,16 +95,21 @@
 3. **Express 동적 보안 라우팅 프록시 (Aegis-3 Proxy)**
    - PostgreSQL 데이터베이스에 등재된 멀티테넌트(Tenant) 및 동적 라우팅 정책을 기반으로 라우팅 처리를 수행합니다.
    - `/api/v1/*` 정상 경로 프록시 매칭은 물론, `/.env`와 같은 환경변수 탈취 공격은 **허니팟(Honeypot Decoy)** 으로 매핑하여 공격자를 안심시키고 백그라운드로 보안 침입 이벤트를 캡처합니다.
+   - **IP 블랙리스트 1차 차단:** SOAR 가 악성으로 판정한 IP(`aegis:blacklist:<IP>`, Redis)는 라우팅·로깅 전에 즉시 `403` 으로 차단합니다. Redis 장애 시에는 정상 요청을 막지 않도록 **fail-open** 으로 통과시키고 `[ALERT]` 로그와 `/health` 로 알립니다.
+   - **클라이언트 IP 판별:** nginx 가 덮어쓴 `X-Real-IP`(Cloudflare 복원 후 실제 방문자 IP)를 기준으로 합니다. 클라이언트가 임의로 넣을 수 있는 `X-Forwarded-For` 는 **서버 내부(루프백·사설망)에서 온 요청일 때만** 신뢰하므로, 외부에서 XFF 를 위조해 블랙리스트를 우회하거나 다른 IP 를 차단시킬 수 없습니다. (시연 스크립트·k6 `SPREAD_IPS` 는 EC2 안에서 `localhost` 로 실행할 때만 XFF 로 IP 를 흉내낼 수 있습니다.)
+   - **고객사 서버 연결 관리:** 고객사 서버로의 연결을 keep-alive 로 재사용하고(`UPSTREAM_MAX_SOCKETS`, 기본 256), 응답이 없으면 `UPSTREAM_TIMEOUT_MS`(기본 15초) 후 `504` 로 끊습니다. upstream 오류는 `[UPSTREAM ERROR]` 로그로 남습니다.
+   - **라우트 캐시 즉시 갱신:** `POST /admin/routes/refresh` (`X-Admin-Key` 헤더가 `ADMIN_REFRESH_KEY` 와 일치해야 함)로 고객사 등록 직후 라우트를 바로 반영합니다.
 
 4. **SOAR 비동기 분산 수집기 (Redis + Celery Worker + Beat)**
    - 침입 Proxy가 캡처한 위협 이벤트를 `Redis` 분산 대기열 큐에 안전하게 완충합니다.
    - `Celery Worker` 백그라운드 데몬이 이벤트 데이터를 파싱, 정규화 및 정밀 검증합니다.
    - **Celery Beat** 가 워커에 내장되어 2초 주기로 큐를 자동 소비하므로, 별도 트리거 없이 들어오는 이벤트가 즉시 분석 파이프라인을 타고 흐릅니다 (`BEAT_CONSUME_INTERVAL` 환경변수로 주기 조정 가능).
+   - 1회 소비 건수는 `CONSUME_BATCH_SIZE`(기본 1000), 워커 동시성은 `CELERY_CONCURRENCY`(기본 4)로 조정합니다. 기존 100건 고정일 때 소비 상한이 약 50 eps 였고, 수정 후 약 410 eps 까지 처리합니다(측정: [docs/soar/SOAR_점검_보고서.md](docs/soar/SOAR_점검_보고서.md)).
 
 5. **Risk Score Engine 정량 분석 (`soar/risk_score_engine`)**
    - 워커가 정규화한 이벤트를 Flask 기반 `detection-engine` 서비스의 `/analyze` 엔드포인트로 전달합니다.
    - 민감 경로 접근, Payload 우회, SSRF, Command Injection 등 다중 detector 가 점수를 합산하여 `risk_score` (0~100), `level` (LOW/SUSPICIOUS/HIGH/CRITICAL), `rule_hits`, `reasons` 가 포함된 정량 결과를 반환합니다.
-   - 결과는 MongoDB `aegis_logs.security_logs` 컬렉션에 모든 상세 정보와 함께 영구 저장됩니다.
+   - 결과는 MongoDB `aegis_logs.traffic_logs` 컬렉션에 모든 상세 정보와 함께 영구 저장됩니다. (portal-backend 가 같은 컬렉션을 읽으므로 compose 의 `MONGO_COLLECTION_NAME=traffic_logs` 를 바꾸면 안 됩니다. 예전 `security_logs` 데이터는 배포 시 `traffic_logs` 로 자동 이관됩니다.)
 
 6. **AI 자동 WAF 룰 생성기 (Gemini LLM + 사이드카 주입)**
    - `risk_score ≥ AI_RULE_THRESHOLD` (기본 80) 인 고위험 이벤트가 발생하면, `ai_engine.py` 가 **Google Gemini 2.5 Flash** 를 호출하여 공격 로그를 분석하고 차단용 **PCRE 정규식 + Coraza SecRule** 을 자동 생성합니다.
@@ -131,7 +140,9 @@
    - MongoDB(트래픽 로그)와 PostgreSQL(고객사/라우팅 정보)을 함께 조회하여 대시보드용 로그 목록·통계·실시간(SSE) 스트림 API를 제공합니다.
    - **Supabase JWT 인증:** 모든 `/api/*` 요청을 Supabase JWKS(공개키)로 서명 검증하고, `user_profiles` 테이블에서 role 을 조회(5분 캐시)하여 권한을 판별합니다.
    - **멀티테넌트 격리:** `admin` 은 전체 데이터, `customer` 는 본인 소유 `tenant_id` 로만 자동 필터링되어 타 고객사 로그 접근을 차단합니다.
-   - **고객사 등록:** `POST /api/customers` 로 tenants/routers 테이블에 등록하며 `api_key` 를 자동 생성합니다.
+   - **고객사 자동 온보딩:** `POST /api/customers` 로 tenants/routers 테이블에 등록하며 `api_key` 를 자동 생성합니다. 고객사가 제출한 **OpenAPI 명세(spec_text)를 파싱해 경로별 라우트 + 캐치올(`/*`) + 디코이(허니팟) 라우트를 한 번에 생성**합니다(명세 파싱 실패 시 캐치올 + 디코이만). `inbound_domain` 은 `https://…/` 처럼 입력해도 소문자 호스트명으로 정규화되어 저장됩니다.
+   - **소유자 연결:** 등록 시 `supabase_user_id` 로 고객 계정과 연결해야 고객사 대시보드에 로그가 보입니다(없으면 관리자 화면에만 표시).
+   - **실시간 스트림:** `/api/logs/stream`(SSE)은 `traffic_logs` 를 2초 간격으로 폴링해 신규 로그를 푸시합니다(`stream_source.py` 의 `db_poll_stream`, replica set 불필요).
 
 ---
 
@@ -139,13 +150,25 @@
 
 ```text
 Aegis-3/
-├── docker-compose.yml              # 전체 통합 다중 컨테이너 오케스트레이션 설정
+├── docker-compose.yml              # 전체 통합 다중 컨테이너 오케스트레이션 설정 (로컬: nginx → host 8080)
+├── docker-compose.prod.yml         # EC2 운영 override (nginx → host 80, Cloudflare 연결)
 ├── .env                            # MongoDB/PostgreSQL/Gemini 마스터 자격증명
+├── .github/workflows/
+│   ├── ci.yml                      # 테스트·이미지 스모크 테스트
+│   └── deploy.yml                  # main push 시 EC2 자동 배포 (헬스체크 실패 시 자동 롤백)
 ├── data/
-│   └── init.sql                    # PostgreSQL 테넌트 및 라우팅/허니팟 초기 데이터
+│   ├── init.sql                    # PostgreSQL 테넌트 및 라우팅/허니팟 초기 데이터
+│   └── specs/                      # 온보딩 시연용 OpenAPI 명세 예시 (MuShop)
+├── docs/
+│   ├── secrets-rotation.md         # 비밀값 교체 주기·절차
+│   └── soar/SOAR_점검_보고서.md     # SOAR 처리량·정합·탐지 점검 결과
 ├── scripts/
 │   ├── setup-crs.sh                # OWASP CRS 룰셋 다운로드 스크립트 (최초 1회)
-│   └── aegis3_load_test.js         # k6 부하 테스트 (p95 지연·처리량 측정)
+│   ├── aegis3_load_test.js         # k6 부하 테스트 (p95 지연·처리량 측정)
+│   ├── demo/                       # 시연 스크립트 (demo.sh, check_detection.sh, 고객사 온보딩 등)
+│   ├── ops/update_cloudflare_ips.sh # Cloudflare IP 대역 갱신 (nginx real IP)
+│   ├── soar_bench/                 # SOAR 큐 처리량 벤치마크·k6 임계값 시뮬레이터
+│   └── experiment/                 # AI 룰 생성·임계값 실험
 ├── tests/
 │   └── masking/                    # 개인정보 마스킹 5×4 검증 매트릭스
 │       ├── mock_backend.py         # 검증 전용 모의 백엔드 (:9100, 표준 라이브러리만 사용)
@@ -174,31 +197,32 @@ Aegis-3/
 │       ├── state.py                # IP/세션별 시간 윈도우 상태 관리
 │       └── utils.py                # 시간 파싱, level 계산
 └── services/
-    └── ingestion/
-        ├── celery_app/             # Celery SOAR 워커 및 인제스션 API (FastAPI)
-        │   ├── Dockerfile
-        │   ├── main.py             # /webhook/logs, /tasks/consume, /health
-        │   ├── celery_app.py       # Celery 앱 + Beat 스케줄 (2초 주기 자동 소비)
-        │   ├── tasks.py            # process_security_log: Risk→Mongo→AI→사이드카 주입
-        │   ├── ai_engine.py        # Gemini 2.5 Flash 호출 + JSON 강제 + 피드백 루프
-        │   └── requirements.txt
-        ├── analyzer/               # Node.js 기반 실시간 알림/차단 자동 대응 엔진
-        │   ├── Dockerfile
-        │   ├── analyzer.js         # 슬랙, 이메일(SMTP), Cloudflare API 처리 엔진 본체
-        │   ├── .env                # 이메일/슬랙/Cloudflare 연동용 자격증명 저장소
-        │   └── package.json
-        └── aegis-portal-backend/   # 고객사 대시보드 로그/통계 조회 API (FastAPI, :8001)
-            ├── Dockerfile
-            ├── requirements.txt
-            ├── .env.example        # 로컬 테스트용 환경변수 템플릿 (.env 는 커밋 금지)
-            └── app/
-                ├── main.py         # FastAPI 엔드포인트 (로그/통계/SSE/고객사)
-                ├── auth.py         # Supabase JWT 검증 + role(user_profiles) 판별
-                ├── customers.py    # 고객사(tenant) 등록·조회, 소유 tenant_id 필터
-                ├── database.py     # MongoDB 연결 (트래픽 로그)
-                ├── postgres.py     # PostgreSQL 연결 (고객사/라우팅 정보)
-                ├── seed_data.py    # [길1 전용] 더미 로그 생성기 (운영 시 삭제)
-                └── stream_source.py # SSE 스트림 소스 (dummy → change_stream 전환)
+    ├── ingestion/
+    │   ├── celery_app/             # Celery SOAR 워커 및 인제스션 API (FastAPI)
+    │   │   ├── Dockerfile
+    │   │   ├── main.py             # /webhook/logs, /tasks/consume, /health
+    │   │   ├── celery_app.py       # Celery 앱 + Beat 스케줄 (2초 주기 자동 소비)
+    │   │   ├── tasks.py            # process_security_log: Risk→Mongo→AI→사이드카 주입
+    │   │   ├── ai_engine.py        # Gemini 2.5 Flash 호출 + JSON 강제 + 피드백 루프
+    │   │   └── requirements.txt
+    │   └── analyzer/               # Node.js 기반 실시간 알림/차단 자동 대응 엔진
+    │       ├── Dockerfile
+    │       ├── analyzer.js         # 슬랙, 이메일(SMTP), Cloudflare API 처리 엔진 본체
+    │       ├── .env                # 이메일/슬랙/Cloudflare 연동용 자격증명 저장소
+    │       └── package.json
+    └── aegis-portal-backend/       # 고객사 대시보드 로그/통계 조회 API (FastAPI, :8001)
+        ├── Dockerfile
+        ├── requirements.txt
+        ├── .env.example            # 로컬 테스트용 환경변수 템플릿 (.env 는 커밋 금지)
+        └── app/
+            ├── main.py             # FastAPI 엔드포인트 (로그/통계/SSE/고객사)
+            ├── auth.py             # Supabase JWT 검증 + role(user_profiles) 판별
+            ├── customers.py        # 고객사 등록(명세→라우트·디코이 자동 생성)·조회, 소유 tenant_id 필터
+            ├── spec_parser.py      # OpenAPI 명세 파싱 + 기본 디코이 경로 정의
+            ├── database.py         # MongoDB 연결 (traffic_logs)
+            ├── postgres.py         # PostgreSQL 연결 (고객사/라우팅 정보)
+            ├── seed_data.py        # [길1 전용] 더미 로그 생성기 (운영 시 삭제)
+            └── stream_source.py    # SSE 스트림 소스 (현재 db_poll_stream: 실데이터 폴링)
 ```
 
 ---
@@ -229,6 +253,17 @@ Aegis-3/
 
   # 선택: Celery Beat 가 Redis 큐를 폴링하는 주기(초). 기본 2.0
   BEAT_CONSUME_INTERVAL=2.0
+
+  # 선택: Beat 1회당 큐에서 꺼낼 최대 건수(기본 1000) / 워커 동시성(기본 4)
+  CONSUME_BATCH_SIZE=1000
+  CELERY_CONCURRENCY=4
+
+  # proxy: /admin/routes/refresh 인증 키 (없으면 해당 엔드포인트는 항상 401)
+  ADMIN_REFRESH_KEY=your_admin_refresh_key
+
+  # 선택(proxy): 고객사 서버 응답 대기 상한(ms, 기본 15000) / 서버당 동시 연결 상한(기본 256)
+  UPSTREAM_TIMEOUT_MS=15000
+  UPSTREAM_MAX_SOCKETS=256
   ```
   > **Note:** MongoDB 패스워드에 `@ : / ? #` 같은 RFC 3986 reserved 문자가 들어가도 워커가 자동으로 URL-encode 합니다 (`MONGO_USER`, `MONGO_HOST`, `MONGO_PORT`, `MONGO_AUTH_SOURCE` 별도 env 로 받아 안전하게 URI 조립).
 
@@ -259,6 +294,7 @@ Aegis-3/
   RULE_ARCHIVE_FILE=/etc/nginx/rules/archived.conf
   ```
   > **Note:** 데모 시연 시에는 `SHADOW_DURATION=30`, `TTL_SECONDS=60` 처럼 짧게 두면 승격·만료 동작을 빠르게 관찰할 수 있습니다. 이 값들은 `.env` 가 아니라 compose 의 nginx 서비스 환경변수로 주입됩니다.
+  > **현재 `docker-compose.yml` 에는 시연값(`SHADOW_DURATION=30`, `TTL_SECONDS=60`, `CLEANUP_INTERVAL=10`)이 들어 있습니다.** 실제 운영 기본값(위 블록)으로 돌리려면 이 세 줄을 지우거나 값을 바꾸세요.
 
 * **대응 엔진 자격증명 설정 (`./services/ingestion/analyzer/.env`):**
   ```env
@@ -294,8 +330,15 @@ Aegis-3/
 
 ### 3. 전체 시스템 빌드 및 컨테이너 가동
 ```bash
+# 로컬 개발 (nginx → http://localhost:8080)
 docker compose up -d --build
+
+# EC2 운영 (nginx → host 80, Cloudflare 가 origin 80 으로 접속)
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 ```
+> **자동 배포:** `main` 에 push(머지)되면 GitHub Actions `deploy.yml` 이 Tailscale 로 EC2 에 접속해 GitHub Secrets 로 `.env` 를 만들고, 전체 스택을 다시 빌드·기동합니다. nginx/portal-backend 헬스체크가 60초 안에 통과하지 못하면 **직전 커밋으로 자동 롤백**합니다. 운영 반영을 위해 EC2 에서 수동으로 명령을 실행할 필요는 없습니다.
+>
+> **포트:** Redis 는 비밀번호가 없고 IP 블랙리스트 저장소이므로 호스트 루프백(`127.0.0.1:6379`)에만 게시합니다. 운영 보안그룹은 80/443(Cloudflare 대역)만 허용합니다.
 모든 다중 서비스들(nginx + 사이드카, proxy, postgres, redis, mongodb, soar-api, soar-worker + Beat, detection-engine, analyzer, portal-backend, 그리고 마스킹 검증용 mock-backend)이 Docker 가상 컴퓨터 위에서 부팅되어 완벽한 고립 네트워크 상태로 작동됩니다.
 
 > **첫 빌드 시간:** libcoraza + coraza-nginx 모듈 컴파일 때문에 5~10분이 걸릴 수 있습니다. 
@@ -349,10 +392,10 @@ python tests/masking/run_matrix.py                          # → PASS/FAIL 매�
 
 | 파일 | 처리 내용 |
 |---|---|
-| [services/aegis-portal-backend/app/seed_data.py](services/aegis-portal-backend/app/seed_data.py) | 파일 삭제 (더미 로그 생성기) |
-| [services/aegis-portal-backend/app/main.py](services/aegis-portal-backend/app/main.py) | `from .seed_data import generate_logs` import 제거 + `POST /api/seed` 엔드포인트 블록 (현재 84~93줄) 삭제 + docstring의 "길1 전용" 줄 정리 |
-| [services/aegis-portal-backend/app/stream_source.py](services/aegis-portal-backend/app/stream_source.py) | 맨 아래 `event_stream = dummy_stream` → `event_stream = change_stream` 으로 변경. **단, MongoDB가 replica set 모드여야 동작** ([docker-compose.yml](docker-compose.yml) 의 mongodb 서비스에 `command: ["--replSet","rs0"]` 추가 + 최초 1회 `rs.initiate()` 필요) |
-| [proxy/app.js](proxy/app.js) | 13~27줄의 데모 핸들러 (`/` 배너 응답, `/user` 마스킹 테스트 JSON) 삭제 |
+| [services/aegis-portal-backend/app/seed_data.py](services/aegis-portal-backend/app/seed_data.py) | 파일 삭제 (더미 로그 생성기). **아래 main.py·stream_source.py 의 import 를 먼저 지워야** 서버가 기동됩니다 |
+| [services/aegis-portal-backend/app/main.py](services/aegis-portal-backend/app/main.py) | `from .seed_data import generate_logs` import 제거 + `POST /api/seed` 엔드포인트 블록(`[길1 전용] 더미 시드` ~ `[길1 전용] 끝` 주석 사이) 삭제 + docstring의 "길1 전용" 줄 정리. ⚠ 이 엔드포인트는 `traffic_logs` 를 **전부 지우고** 더미로 채우므로 운영에서 호출 금지 |
+| [services/aegis-portal-backend/app/stream_source.py](services/aegis-portal-backend/app/stream_source.py) | 실데이터 전환은 이미 완료(`event_stream = db_poll_stream`, replica set 불필요). `from .seed_data import generate_log` import 와 `dummy_stream` 함수만 삭제. (지연을 더 줄이려면 `change_stream` 으로 교체 가능 — mongodb 에 `--replSet rs0` + `rs.initiate()` 필요) |
+| [proxy/app.js](proxy/app.js) | 데모 핸들러 (`app.get('/')` 배너 응답, `app.get('/user')` 마스킹 테스트 JSON) 삭제. 둘 다 해당 도메인에 고객사 라우트가 있으면 고객사로 넘기므로 운영 트래픽에는 영향 없음 |
 | [data/init.sql](data/init.sql) | `Test Company` 및 `localhost` 테스트 라우트 INSERT 블록 삭제 — 실 고객사는 portal-backend의 `POST /api/customers` 로 등록 |
 
 ### C. 이미 EC2에 떠있는 컨테이너 즉시 정리 명령어
@@ -382,7 +425,7 @@ sudo docker compose up -d --build portal-backend proxy nginx
 - [ ] `services/*/test_*.py`, `*_test.py` 가 컨테이너에 들어가지 않는지 확인:
       `docker exec aegis-soar-api ls /app/ | grep -i test` → 결과 없어야 함
 - [ ] portal-backend `/api/seed` 호출 시 404 인지 확인 (B 항목 적용됨)
-- [ ] 대시보드에 더미 로그가 아닌 실 SOAR 파이프라인 로그가 흐르는지 확인 (`stream_source.py` 가 change_stream 로 전환됨)
+- [ ] 대시보드에 더미 로그가 아닌 실 SOAR 파이프라인 로그가 흐르는지 확인 (`stream_source.py` 의 `event_stream = db_poll_stream`)
 - [ ] `data/init.sql` 의 `Test Company` 가 운영 DB 에 없는지 확인:
       `docker exec aegis-postgres psql -U aegis_admin -d aegis_proxy -c "SELECT company_name FROM tenants"`
 - [ ] 노출된 자격증명이 GitHub Secrets / EC2 .env / DB 비밀번호 어디에도 남아있지 않은지 확인
