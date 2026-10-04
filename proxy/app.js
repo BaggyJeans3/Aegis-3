@@ -134,16 +134,34 @@ function normalizeHost(hostHeader) {
   return hostHeader.split(':')[0].toLowerCase()
 }
 
+// 루프백·사설망(RFC1918, IPv6 ULA) 여부. EC2 호스트/도커 브리지에서 들어온 내부 요청 판별용.
+function isInternalIp(ip) {
+  const addr = String(ip).replace(/^::ffff:/, '')
+  if (addr === '::1' || /^f[cd]/i.test(addr)) return true
+  const m = addr.match(/^(\d+)\.(\d+)\.\d+\.\d+$/)
+  if (!m) return false
+  const a = Number(m[1])
+  const b = Number(m[2])
+  return (
+    a === 127 ||
+    a === 10 ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  )
+}
+
 function getClientIp(req) {
+  // X-Real-IP 는 nginx 가 Cloudflare real IP 복원 후 $remote_addr 로 덮어쓴 값이라 위조할 수 없다.
+  // X-Forwarded-For 첫 값은 클라이언트가 임의로 넣을 수 있어(블랙리스트 우회·타인 IP 차단),
+  // 서버 내부에서 돌리는 시연 스크립트·k6(SPREAD_IPS) 요청일 때만 신뢰한다.
+  const realIp = req.headers['x-real-ip'] || req.ip || 'unknown'
   const forwardedFor = req.headers['x-forwarded-for']
 
-  // [수정] Nginx/Cloudflare 뒤에 있을 때 X-Forwarded-For에는
-  // "client, proxy1, proxy2"처럼 여러 IP가 들어갈 수 있으므로 첫 번째 IP를 우선 사용한다.
-  if (forwardedFor) {
+  if (forwardedFor && isInternalIp(realIp)) {
     return String(forwardedFor).split(',')[0].trim()
   }
 
-  return req.headers['cf-connecting-ip'] || req.ip || 'unknown'
+  return realIp
 }
 
 function matchPath(pattern, requestPath) {

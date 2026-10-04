@@ -111,7 +111,7 @@ def build_stream(scenario, latency, client_ip, rng, max_seconds=None, spread_ips
                     "headers": {}, "status_code": 403, "action_on_match": "block",
                 }
             if spread_ips and ev["event_type"] == "access_event":
-                # k6 SPREAD_IPS=N: X-Forwarded-For 를 N개 IP 로 분산 (proxy 는 XFF 첫 값을 client IP 로 씀)
+                # k6 SPREAD_IPS=N: X-Forwarded-For 를 N개 IP 로 분산 (proxy 는 내부(사설/루프백) 요청일 때만 XFF 첫 값을 client IP 로 씀)
                 n_ip = rng.randrange(spread_ips)
                 ev["ip"] = f"198.18.{n_ip // 256}.{n_ip % 256}"
             else:

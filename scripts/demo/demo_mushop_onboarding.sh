@@ -61,9 +61,17 @@ fi
 # [A] 기존 데이터 정리 (재실행 가능하도록)
 # ============================================================
 header "[A] 사전 정리 — 기존 MuShop 등록 제거"
-sudo docker exec -i aegis-postgres psql -U aegis_admin -d aegis_proxy > /dev/null 2>&1 <<'SQL'
-DELETE FROM routers WHERE tenant_id IN (SELECT tenant_id FROM tenants WHERE company_name = 'MuShop');
-DELETE FROM tenants WHERE company_name = 'MuShop';
+# 이전 시연이 만든 행(소유자 없음 또는 이번에 지정한 소유자)만 지운다.
+# company_name 만으로 지우면 다른 고객 계정이 소유한 실제 MuShop 테넌트까지 삭제된다.
+if [[ -n "$OWNER_USER_ID" && ! "$OWNER_USER_ID" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+  fail "OWNER_USER_ID 가 UUID 형식이 아닙니다: $OWNER_USER_ID"
+  exit 1
+fi
+OWNER_COND="supabase_user_id IS NULL"
+[ -n "$OWNER_USER_ID" ] && OWNER_COND="($OWNER_COND OR supabase_user_id = '$OWNER_USER_ID')"
+sudo docker exec -i aegis-postgres psql -U aegis_admin -d aegis_proxy > /dev/null 2>&1 <<SQL
+DELETE FROM routers WHERE tenant_id IN (SELECT tenant_id FROM tenants WHERE company_name = 'MuShop' AND $OWNER_COND);
+DELETE FROM tenants WHERE company_name = 'MuShop' AND $OWNER_COND;
 SQL
 success "이전 시연 데이터 정리 완료 (재실행 대비)"
 pause 2

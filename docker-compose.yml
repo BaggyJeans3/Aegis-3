@@ -91,8 +91,10 @@ services:
     restart: unless-stopped
     networks:
       - aegis-net
+    # 비밀번호 없는 Redis(IP 블랙리스트 저장소)라 외부 노출 금지 → 호스트 루프백에만 게시.
+    # (컨테이너끼리는 aegis-net 의 redis:6379 로 통신하므로 영향 없음)
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
 
   # 5. MongoDB (로그 저장)
   mongodb:
