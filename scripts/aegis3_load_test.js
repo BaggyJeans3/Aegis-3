@@ -20,6 +20,8 @@
  *   - 기본 실행은 모든 VU 가 같은 IP → 정상 트래픽도 R-RATE-002(50점, HIGH)로 대시보드에 찍힌다(정상 동작).
  *     '다수의 정상 사용자' 부하를 재려면 -e SPREAD_IPS=1024 로 정상 요청의 X-Forwarded-For 를 분산한다.
  *     (벤치마크 전용 대역 198.18.0.0/15 사용)
+ *     ⚠ proxy 는 서버 내부(사설/루프백)에서 온 요청의 XFF 만 믿는다 → SPREAD_IPS 는 EC2 안에서
+ *       TARGET=http://localhost 로 돌릴 때만 효과가 있다. 외부에서 Cloudflare 경유로 돌리면 무시된다.
  *   - SOAR 쪽 사전 점검: python3 scripts/soar_bench/k6_threshold_sim.py [--spread-ips 1024]
  *
  * Docker로 실행 (k6 설치 불필요):
