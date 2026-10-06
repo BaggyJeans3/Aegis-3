@@ -2,10 +2,13 @@
 # ============================================================
 # Aegis-3 풀 시연 스크립트 (EC2 환경)
 # 사용법: chmod +x demo.sh && ./demo.sh
+#   고객사 대시보드에 로그를 띄우려면 고객사 계정에 등록된 도메인으로 보낸다:
+#   DEMO_HOST=mushop.aegis3.cloud ./demo.sh   (기본값 test.aegis3.cloud 는 어느 고객사에도 등록돼 있지 않아 관리자 대시보드에만 보인다)
 # ============================================================
 
 BASE="http://localhost"
-H="Host: test.aegis3.cloud"
+DEMO_HOST="${DEMO_HOST:-test.aegis3.cloud}"
+H="Host: $DEMO_HOST"
 ATK="X-Forwarded-For: 203.0.113.99"
 
 # 색상
@@ -62,7 +65,7 @@ header "[A] 정상 트래픽 — 시스템 정상 동작 확인"
 pause 2
 
 subheader "일반 사용자가 정상적으로 사이트에 접근"
-info "→ curl http://test.aegis3.cloud/index.html"
+info "→ curl http://$DEMO_HOST/index.html"
 pause 3
 
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" -H "$H" "$BASE/index.html")
@@ -101,7 +104,7 @@ pause 2
 
 subheader "공격자가 SQL Injection 시도"
 info "페이로드: id=1' OR '1'='1"
-info "→ curl 'http://test.aegis3.cloud/?id=1%27+OR+%271%27=%271'"
+info "→ curl 'http://$DEMO_HOST/?id=1%27+OR+%271%27=%271'"
 pause 4
 
 STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
@@ -148,7 +151,7 @@ header "[E] 허니팟 — 공격자 기만 (Decoy 응답)"
 pause 2
 
 subheader "공격자가 환경변수 탈취 시도"
-info "→ curl http://test.aegis3.cloud/.env"
+info "→ curl http://$DEMO_HOST/.env"
 info "→ 차단이 아닌 '가짜 성공 응답' 으로 공격자를 안심시킴"
 pause 4
 
