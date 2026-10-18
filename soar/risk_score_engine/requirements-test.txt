@@ -3,5 +3,5 @@ pytest>=8
 flask>=3
 celery>=5.3
 redis>=5
-pymongo>=4.6
+pymongo>=4.18.2
 requests>=2.31
