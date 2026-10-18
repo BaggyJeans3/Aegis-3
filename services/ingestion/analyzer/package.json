@@ -12,7 +12,7 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@slack/bolt": "^4.7.2",
+    "@slack/bolt": "^5.1.0",
     "axios": "^1.16.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
